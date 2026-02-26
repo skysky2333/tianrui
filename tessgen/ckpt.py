@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+
+from .edge_model import EdgeModel, EdgeModelConfig
+from .node_diffusion import DiffusionConfig, DiffusionSchedule, NodeDenoiser, NodeDenoiserConfig, NPredictor
+from .scaler import StandardScaler
+from .surrogate import SurrogateConfig, SurrogateModel
+
+
+@dataclass(frozen=True)
+class SurrogateBundle:
+    model: SurrogateModel
+    target_cols: list[str]
+    log_cols: set[str]
+    scaler: StandardScaler
+
+
+def load_surrogate(ckpt_path: str, *, device: torch.device) -> SurrogateBundle:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    cfg = SurrogateConfig(**ckpt["cfg"])
+    target_cols = list(ckpt["target_cols"])
+    log_cols = set(ckpt["log_cols"])
+    scaler = StandardScaler(mean=np.array(ckpt["scaler_mean"], dtype=np.float32), std=np.array(ckpt["scaler_std"], dtype=np.float32))
+    model = SurrogateModel(y_dim=len(target_cols), cfg=cfg).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    return SurrogateBundle(model=model, target_cols=target_cols, log_cols=log_cols, scaler=scaler)
+
+
+@dataclass(frozen=True)
+class EdgeBundle:
+    model: EdgeModel
+    k: int
+
+
+def load_edge_model(ckpt_path: str, *, device: torch.device) -> EdgeBundle:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    cfg = EdgeModelConfig(**ckpt["cfg"])
+    k = int(ckpt["k"])
+    model = EdgeModel(cfg=cfg).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    return EdgeBundle(model=model, k=k)
+
+
+@dataclass(frozen=True)
+class NodeDiffusionBundle:
+    denoiser: NodeDenoiser
+    n_pred: NPredictor
+    schedule: DiffusionSchedule
+    cond_cols: list[str]
+    log_cols: set[str]
+    cond_scaler: StandardScaler
+    k_nn: int
+
+
+def load_node_diffusion(ckpt_path: str, *, device: torch.device) -> NodeDiffusionBundle:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    den_cfg = NodeDenoiserConfig(**ckpt["denoiser_cfg"])
+    schedule_cfg = DiffusionConfig(**ckpt["schedule_cfg"])
+    schedule = DiffusionSchedule(schedule_cfg).to(device)
+    denoiser = NodeDenoiser(den_cfg).to(device)
+    denoiser.load_state_dict(ckpt["denoiser_state"])
+    denoiser.eval()
+    n_pred = NPredictor(cond_dim=den_cfg.cond_dim, d_h=den_cfg.d_h).to(device)
+    n_pred.load_state_dict(ckpt["n_pred_state"])
+    n_pred.eval()
+    cond_cols = list(ckpt["cond_cols"])
+    log_cols = set(ckpt["log_cols"])
+    cond_scaler = StandardScaler(
+        mean=np.array(ckpt["cond_scaler_mean"], dtype=np.float32),
+        std=np.array(ckpt["cond_scaler_std"], dtype=np.float32),
+    )
+    k_nn = int(ckpt["k_nn"])
+    return NodeDiffusionBundle(
+        denoiser=denoiser,
+        n_pred=n_pred,
+        schedule=schedule,
+        cond_cols=cond_cols,
+        log_cols=log_cols,
+        cond_scaler=cond_scaler,
+        k_nn=k_nn,
+    )
