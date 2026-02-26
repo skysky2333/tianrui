@@ -13,6 +13,7 @@ from ..data import undirected_to_directed_edge_index
 from ..generation import ddpm_sample_coords, sample_edges_from_coords, sample_node_count
 from ..transforms import apply_log_cols_torch, invert_log_cols_torch
 from ..utils import Batch, device_from_arg, ensure_dir, set_seed
+from ..viz import save_graph_figure
 
 
 def _parse_kv_list(items: list[str]) -> dict[str, float]:
@@ -167,6 +168,8 @@ def main() -> None:
         node_path = Path(args.out_dir) / f"Node_gen_{i}.txt"
         conn_path = Path(args.out_dir) / f"Connection_gen_{i}.txt"
         meta_path = Path(args.out_dir) / f"meta_{i}.json"
+        fig_png = Path(args.out_dir) / "figures" / f"graph_gen_{i}.png"
+        fig_svg = Path(args.out_dir) / "figures" / f"graph_gen_{i}.svg"
 
         with open(node_path, "w") as f:
             for nid, (x, y) in enumerate(coords, start=1):
@@ -190,6 +193,14 @@ def main() -> None:
                 f,
                 indent=2,
             )
+
+        save_graph_figure(
+            coords=coords,
+            edges_uv=r["edges_uv"],
+            out_png=str(fig_png),
+            out_svg=str(fig_svg),
+            title=f"gen {i} | rd={r['rd']:.4g} | err_mse_z={r['err']:.3g} | N={r['n_nodes']} E={r['n_edges']}",
+        )
 
     best_rd = keep[0]["rd"] if keep else None
     print(

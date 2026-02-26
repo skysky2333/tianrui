@@ -15,26 +15,28 @@ The dataset lives in:
 
 The code expects a conda env with PyTorch + common scientific Python packages.
 
-By default, training/generation uses `--device auto` which selects `cuda` → `mps` → `cpu`.
-
 Training and Optuna tuning default to `--num_workers 4` for faster input loading.
-
-## Memory notes (MPS/CUDA)
-
-- On Apple `mps` (and sometimes `cuda`), PyTorch may grow **reserved** device memory over time due to allocator caching.
-  Training scripts include an `EmptyCacheCallback` that clears the device cache at epoch boundaries, and Optuna tuning
-  clears caches between trials to prevent runaway memory growth.
-
-Inference artifacts (`surrogate.pt`, `edge_model.pt`, `node_diffusion.pt`) are loaded with `torch.load(..., weights_only=True)`.
-If you have older artifacts that contain non-safe objects (e.g. numpy arrays), re-export them by re-running the corresponding
-training script.
 
 Dependencies used by the training framework:
 - PyTorch Lightning (`pytorch_lightning`)
 - Optuna (`optuna`) for optional hyperparameter tuning
 - Matplotlib (`matplotlib`) for report figures
 
-## Quickstart (smoke)
+## Visualization
+
+Visualize an existing `Node_*.txt` + `Connection_*.txt` pair:
+
+```bash
+conda run -n tianrui python -m tessgen.cli.visualize_graph \
+  --node_path data/Tessellation_Dataset/Node_1.txt \
+  --conn_path data/Tessellation_Dataset/Connection_1.txt \
+  --out_png out/graph_1.png \
+  --out_svg out/graph_1.svg
+```
+
+`tessgen.cli.generate` also writes `--out_dir/figures/graph_gen_<i>.png` and `graph_gen_<i>.svg` for each saved sample.
+
+## Quickstart
 
 1) Sanity-check parsing:
 
@@ -50,7 +52,8 @@ conda run -n tianrui python -m tessgen.cli.train_surrogate \
   --target_cols RS \
   --epochs 32 \
   --batch_size 64 \
-  --out_dir runs/surrogate
+  --out_dir runs/surrogate \
+  --device cpu
 ```
 
 Outputs in `runs/surrogate/`:
@@ -63,8 +66,9 @@ Outputs in `runs/surrogate/`:
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.train_edge \
-  --epochs 1 \
-  --out_dir runs/edge
+  --epochs 8 \
+  --out_dir runs/edge \
+  --device cpu
 ```
 
 Outputs in `runs/edge/`:
@@ -79,8 +83,9 @@ Outputs in `runs/edge/`:
 conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
   --data_csv data/Data_2.csv \
   --cond_cols RS \
-  --epochs 1 \
-  --out_dir runs/node_diffusion
+  --epochs 8 \
+  --out_dir runs/node_diffusion \
+  --device cpu
 ```
 
 Outputs in `runs/node_diffusion/`:
@@ -159,3 +164,7 @@ Each tuning run writes `trials.csv`, `best.json`, `optuna_history.png`, and `con
 - `tessgen/models/surrogate/`: surrogate model + Lightning trainer + Optuna tuner + reports
 - `tessgen/models/edge/`: edge model + Lightning trainer + Optuna tuner + reports
 - `tessgen/models/node_diffusion/`: node diffusion model + Lightning trainer + Optuna tuner + reports
+
+## Acknowledgement
+
+This repo is created with assistance by LLMs from OpenAI and/or Antropic.
