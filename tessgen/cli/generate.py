@@ -49,6 +49,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--k", type=int, default=2, help="Samples per (RD, N) combination")
     p.add_argument("--top_m", type=int, default=3, help="How many best samples to save")
     p.add_argument("--deg_cap", type=int, default=12)
+    p.add_argument("--edge_thr", type=float, default=0.5, help="Edge probability threshold used during edge sampling")
     p.add_argument("--min_n", type=int, default=64)
     p.add_argument("--max_n", type=int, default=5000)
     p.add_argument("--n_nodes", type=int, default=None, help="If set, fix the number of nodes N.")
@@ -70,6 +71,9 @@ def main() -> None:
     ensure_dir(args.out_dir)
     set_seed(args.seed)
     device = device_from_arg(args.device)
+
+    if not (0.0 <= float(args.edge_thr) <= 1.0):
+        raise SystemExit(f"--edge_thr must be in [0,1]; got {args.edge_thr}")
 
     cond_dict = _parse_kv_list(list(args.cond))
 
@@ -183,6 +187,7 @@ def main() -> None:
                         coords01=coords01,
                         k=edge_bundle.k,
                         deg_cap=int(args.deg_cap),
+                        edge_thr=float(args.edge_thr),
                         ensure_connected=True,
                         device=device,
                     )
@@ -263,6 +268,9 @@ def main() -> None:
                     "cond": cond_dict,
                     "n_nodes": r["n_nodes"],
                     "n_edges": r["n_edges"],
+                    "deg_cap": int(args.deg_cap),
+                    "edge_thr": float(args.edge_thr),
+                    "edge_k": int(edge_bundle.k),
                     "pred": r["pred"],
                 },
                 f,
@@ -291,6 +299,8 @@ def main() -> None:
                 "rd_search": args.rd is None,
                 "rd_candidates": rd_values if args.rd is None else None,
                 "k_per_combo": int(k_per_combo),
+                "deg_cap": int(args.deg_cap),
+                "edge_thr": float(args.edge_thr),
                 "n_nodes": int(args.n_nodes) if args.n_nodes is not None else None,
                 "n_candidates": [int(x) for x in list(args.n_candidates)] if list(args.n_candidates) else None,
                 "n_prior_ckpt": str(args.n_prior_ckpt) if str(args.n_prior_ckpt) else None,

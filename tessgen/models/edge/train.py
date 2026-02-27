@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from .core import EdgeModelConfig
 from .dataset import EdgeGraphDataset
 from .lit_module import EdgeLitModule, export_edge_pt
+from .preview_callback import EdgePreviewEveryEpochCallback
 from .report import eval_edge_model, make_report_and_figures
 from ...data import collate_first, discover_graph_ids, train_val_test_split_graph_ids
 from ...pl_callbacks import EmptyCacheCallback, JsonlMetricsCallback
@@ -34,10 +35,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--out_dir", type=str, required=True)
     p.add_argument("--num_workers", type=int, default=4)
 
-    p.add_argument("--k", type=int, default=12)
+    p.add_argument("--k", type=int, default=48)
     p.add_argument("--neg_ratio", type=float, default=3.0)
     p.add_argument("--thr", type=float, default=0.5, help="Threshold for P(edge) in report metrics")
     p.add_argument("--max_pairs_report", type=int, default=2_000_000, help="Max candidate pairs to evaluate for curves")
+
+    p.add_argument("--preview_each_epoch", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--preview_epoch_graphs", type=int, default=10)
+    p.add_argument("--preview_edge_thr", type=float, default=0.5, help="Edge probability threshold used for preview sampling")
+    p.add_argument("--preview_deg_cap", type=int, default=12)
+    p.add_argument("--preview_save_svg", action=argparse.BooleanOptionalAction, default=True)
 
     p.add_argument("--d_h", type=int, default=128)
     p.add_argument("--n_layers", type=int, default=3)
@@ -56,6 +63,9 @@ def main() -> None:
     ensure_dir(args.out_dir)
     set_seed(args.seed)
     pl.seed_everything(args.seed, workers=True)
+
+    if not (0.0 <= float(args.preview_edge_thr) <= 1.0):
+        raise SystemExit(f"--preview_edge_thr must be in [0,1]; got {args.preview_edge_thr}")
 
     dev = lightning_device_from_arg(args.device)
     num_workers = int(args.num_workers)
@@ -86,7 +96,18 @@ def main() -> None:
         save_last=True,
     )
     history_path = str(Path(args.out_dir) / "history.jsonl")
-    callbacks = [ckpt_cb, JsonlMetricsCallback(history_path), EmptyCacheCallback()]
+    preview_cb = None
+    if bool(args.preview_each_epoch):
+        preview_cb = EdgePreviewEveryEpochCallback(
+            tess_root=str(args.tess_root),
+            graph_ids=val_g,
+            out_dir_base=str(Path(args.out_dir) / "preview_val"),
+            epoch_graphs=int(args.preview_epoch_graphs),
+            edge_thr=float(args.preview_edge_thr),
+            deg_cap=int(args.preview_deg_cap),
+            save_svg=bool(args.preview_save_svg),
+        )
+    callbacks = [c for c in [ckpt_cb, preview_cb, JsonlMetricsCallback(history_path), EmptyCacheCallback()] if c is not None]
 
     t0 = time.time()
     trainer = pl.Trainer(
@@ -148,6 +169,13 @@ def main() -> None:
         "k": int(args.k),
         "neg_ratio": float(args.neg_ratio),
         "thr": float(args.thr),
+        "preview": {
+            "each_epoch": bool(args.preview_each_epoch),
+            "epoch_graphs": int(args.preview_epoch_graphs),
+            "edge_thr": float(args.preview_edge_thr),
+            "deg_cap": int(args.preview_deg_cap),
+            "save_svg": bool(args.preview_save_svg),
+        },
         "splits": {"val_frac": float(args.val_frac), "test_frac": float(args.test_frac)},
         "device": {"accelerator": dev.accelerator, "devices": dev.devices},
         "elapsed_sec": float(time.time() - t0),

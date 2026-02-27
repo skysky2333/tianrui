@@ -107,12 +107,19 @@ def save_graph_figure(
     if edges_uv.ndim != 2 or edges_uv.shape[1] != 2:
         raise ValueError(f"edges_uv must be (E,2); got {edges_uv.shape}")
 
+    out_png = str(out_png) if out_png else ""
+    out_svg = str(out_svg) if out_svg else ""
+    if not out_png and not out_svg:
+        raise ValueError("At least one of out_png or out_svg must be provided")
+
     mpl_setup()
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
 
-    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
-    Path(out_svg).parent.mkdir(parents=True, exist_ok=True)
+    if out_png:
+        Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    if out_svg:
+        Path(out_svg).parent.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(6.5, 6.5))
 
@@ -150,7 +157,8 @@ def save_graph_figure(
             s.set_visible(False)
 
     fig.tight_layout()
-    fig.savefig(out_png, dpi=int(dpi))
-    fig.savefig(out_svg)
+    if out_png:
+        fig.savefig(out_png, dpi=int(dpi))
+    if out_svg:
+        fig.savefig(out_svg)
     plt.close(fig)
-

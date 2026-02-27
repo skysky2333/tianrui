@@ -70,7 +70,7 @@ Outputs in `runs/surrogate/`:
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.train_edge \
-  --epochs 8 \
+  --epochs 32 \
   --out_dir runs/edge \
   --device cpu
 ```
@@ -80,6 +80,7 @@ Outputs in `runs/edge/`:
 - `best.ckpt` / `last.ckpt` (Lightning checkpoints)
 - `config.json`, `history.jsonl`, `report.json`
 - `figures/` (loss curve, PR/ROC curves, probability histograms; includes `loss_bce_logy.png`)
+- `preview_val/epoch_###/` (optional per-epoch qualitative previews; disable with `--no-preview_each_epoch`)
 
 4) Train an N prior (RD + metrics → log(N)):
 
@@ -104,7 +105,7 @@ Outputs in `runs/n_prior/`:
 conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
   --data_csv data/Data_2.csv \
   --cond_cols RS \
-  --epochs 8 \
+  --epochs 16 \
   --out_dir runs/node_diffusion \
   --device cpu
 ```
@@ -123,7 +124,9 @@ conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
   --cycle_surrogate_ckpt runs/surrogate/surrogate.pt \
   --cycle_edge_ckpt runs/edge/edge_model.pt \
   --cycle_k_best 8 \
-  --cycle_epoch_rows 10
+  --cycle_edge_thr 0.5 \
+  --cycle_epoch_rows 10 \
+  --report_max_samples 50
 ```
 
 To disable the per-epoch validation cycle eval (and monitor `val/loss` instead), add `--no-cycle_each_epoch`.
@@ -150,6 +153,7 @@ conda run -n tianrui python -m tessgen.cli.generate \
   --cond RS=0.01 \
   --n_nodes 1024 \
   --k 4 \
+  --edge_thr 0.5 \
   --surrogate_ckpt runs/surrogate/surrogate.pt \
   --node_ckpt runs/node_diffusion/node_diffusion.pt \
   --edge_ckpt runs/edge/edge_model.pt \
@@ -159,6 +163,7 @@ conda run -n tianrui python -m tessgen.cli.generate \
 
 Notes:
 - The generator is **stochastic**: use `--k` to sample multiple candidates and select by surrogate score.
+- `--edge_thr` controls graph sparsity by filtering low-confidence edges before applying `--deg_cap` (a hard maximum degree).
 - Conditioning on **more than RS** will generally produce tighter, more identifiable generations.
 - If you omit `--n_nodes`, provide either `--n_candidates` (grid search) or `--n_prior_ckpt` (sample candidate N values).
 
@@ -175,6 +180,7 @@ conda run -n tianrui python -m tessgen.cli.generate \
   --n_prior_ckpt runs/n_prior/n_prior.pt \
   --n_prior_samples 12 \
   --k 2 \
+  --edge_thr 0.5 \
   --surrogate_ckpt runs/surrogate/surrogate.pt \
   --node_ckpt runs/node_diffusion/node_diffusion.pt \
   --edge_ckpt runs/edge/edge_model.pt \
@@ -195,6 +201,7 @@ conda run -n tianrui python -m tessgen.cli.benchmark_cycle \
   --surrogate_ckpt runs/surrogate/surrogate.pt \
   --node_ckpt runs/node_diffusion/node_diffusion.pt \
   --edge_ckpt runs/edge/edge_model.pt \
+  --edge_thr 0.5 \
   --out_dir out/bench_cycle \
   --device cpu
 ```

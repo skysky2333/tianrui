@@ -50,6 +50,7 @@ def run_cycle_eval(
     deg_cap: int,
     min_n: int,
     max_n: int,
+    edge_thr: float = 0.5,
     n_mode: str = "true",  # true|fixed|candidates|prior
     n_fixed: int = 0,
     n_candidates: list[int] | None = None,
@@ -232,6 +233,7 @@ def run_cycle_eval(
                         coords01=coords01,
                         k=edge_bundle.k,
                         deg_cap=int(deg_cap),
+                        edge_thr=float(edge_thr),
                         ensure_connected=True,
                         device=device,
                     )
@@ -496,6 +498,8 @@ def run_cycle_eval(
         "task": "cycle_eval",
         "rows": {"n": int(len(row_indices))},
         "k_best": int(k_best),
+        "deg_cap": int(deg_cap),
+        "edge_thr": float(edge_thr),
         "metrics": metrics,
         "artifacts": artifacts,
         "elapsed_sec": float(time.time() - t0),

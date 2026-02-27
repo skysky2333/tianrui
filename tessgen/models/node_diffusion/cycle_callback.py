@@ -46,6 +46,7 @@ class CycleEvalEveryEpochCallback(pl.Callback):
         deg_cap: int,
         min_n: int,
         max_n: int,
+        edge_thr: float,
         n_mode: str,
         n_fixed: int,
         n_candidates: list[int],
@@ -68,6 +69,7 @@ class CycleEvalEveryEpochCallback(pl.Callback):
         self.deg_cap = int(deg_cap)
         self.min_n = int(min_n)
         self.max_n = int(max_n)
+        self.edge_thr = float(edge_thr)
         self.n_mode = str(n_mode)
         self.n_fixed = int(n_fixed)
         self.n_candidates = [int(x) for x in n_candidates]
@@ -105,6 +107,7 @@ class CycleEvalEveryEpochCallback(pl.Callback):
             deg_cap=int(self.deg_cap),
             min_n=int(self.min_n),
             max_n=int(self.max_n),
+            edge_thr=float(self.edge_thr),
             n_mode=str(self.n_mode),
             n_fixed=int(self.n_fixed),
             n_candidates=[int(x) for x in self.n_candidates],

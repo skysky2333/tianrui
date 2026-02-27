@@ -28,6 +28,7 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--k_best", type=int, default=8, help="How many samples per row for best-of-k evaluation")
     p.add_argument("--deg_cap", type=int, default=12)
+    p.add_argument("--edge_thr", type=float, default=0.5, help="Edge probability threshold used during edge sampling")
     p.add_argument("--min_n", type=int, default=64)
     p.add_argument("--max_n", type=int, default=5000)
     p.add_argument("--n_mode", type=str, default="true", help="N selection: true|fixed|candidates|prior")
@@ -47,6 +48,9 @@ def main() -> None:
     args = _parse_args()
     ensure_dir(args.out_dir)
     set_seed(int(args.seed))
+
+    if not (0.0 <= float(args.edge_thr) <= 1.0):
+        raise SystemExit(f"--edge_thr must be in [0,1]; got {args.edge_thr}")
 
     device = device_from_arg(args.device)
     surrogate = load_surrogate(args.surrogate_ckpt, device=device)
@@ -85,6 +89,7 @@ def main() -> None:
         deg_cap=int(args.deg_cap),
         min_n=int(args.min_n),
         max_n=int(args.max_n),
+        edge_thr=float(args.edge_thr),
         n_mode=str(args.n_mode),
         n_fixed=int(args.n_fixed),
         n_candidates=[int(x) for x in list(args.n_candidates)],

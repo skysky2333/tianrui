@@ -72,6 +72,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--cycle_edge_ckpt", type=str, default="", help="Edge model ckpt used for cycle eval")
     p.add_argument("--cycle_k_best", type=int, default=8)
     p.add_argument("--cycle_deg_cap", type=int, default=12)
+    p.add_argument("--cycle_edge_thr", type=float, default=0.5, help="Edge probability threshold used during cycle eval edge sampling")
     p.add_argument("--cycle_min_n", type=int, default=64)
     p.add_argument("--cycle_max_n", type=int, default=5000)
     p.add_argument("--cycle_n_mode", type=str, default="true", help="N selection: true|fixed|candidates|prior")
@@ -115,6 +116,9 @@ def main() -> None:
     ensure_dir(args.out_dir)
     set_seed(args.seed)
     pl.seed_everything(args.seed, workers=True)
+
+    if not (0.0 <= float(args.cycle_edge_thr) <= 1.0):
+        raise SystemExit(f"--cycle_edge_thr must be in [0,1]; got {args.cycle_edge_thr}")
 
     cond_cols = list(args.cond_cols)
     log_cols = set(args.log_cols or [])
@@ -215,6 +219,7 @@ def main() -> None:
             deg_cap=int(args.cycle_deg_cap),
             min_n=int(args.cycle_min_n),
             max_n=int(args.cycle_max_n),
+            edge_thr=float(args.cycle_edge_thr),
             n_mode=str(args.cycle_n_mode),
             n_fixed=int(args.cycle_n_fixed),
             n_candidates=[int(x) for x in list(args.cycle_n_candidates)],
@@ -316,6 +321,7 @@ def main() -> None:
             deg_cap=int(args.cycle_deg_cap),
             min_n=int(args.cycle_min_n),
             max_n=int(args.cycle_max_n),
+            edge_thr=float(args.cycle_edge_thr),
             n_mode=str(args.cycle_n_mode),
             n_fixed=int(args.cycle_n_fixed),
             n_candidates=[int(x) for x in list(args.cycle_n_candidates)],
@@ -343,6 +349,7 @@ def main() -> None:
             "edge_ckpt": str(args.cycle_edge_ckpt) if str(args.cycle_edge_ckpt) else None,
             "k_best": int(args.cycle_k_best),
             "deg_cap": int(args.cycle_deg_cap),
+            "edge_thr": float(args.cycle_edge_thr),
             "min_n": int(args.cycle_min_n),
             "max_n": int(args.cycle_max_n),
             "n_mode": str(args.cycle_n_mode),

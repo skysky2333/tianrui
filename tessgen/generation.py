@@ -59,9 +59,14 @@ def sample_edges_from_coords(
     coords01: torch.Tensor,  # (N,2)
     k: int,
     deg_cap: int = 12,
+    edge_thr: float = 0.5,
     ensure_connected: bool = True,
     device: torch.device,
 ) -> np.ndarray:
+    edge_thr = float(edge_thr)
+    if not (0.0 <= edge_thr <= 1.0):
+        raise ValueError(f"edge_thr must be in [0,1]; got {edge_thr}")
+
     coords_np = coords01.detach().cpu().numpy()
     cand = knn_candidate_pairs(coords_np, k=int(k))
     if cand.shape[0] == 0:
@@ -72,7 +77,13 @@ def sample_edges_from_coords(
     probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
 
     n_nodes = int(coords01.shape[0])
-    edges = enforce_degree_cap(n_nodes, cand, probs, deg_cap=int(deg_cap))
+    mask = probs >= edge_thr
+    cand_f = cand[mask]
+    probs_f = probs[mask]
+    if cand_f.shape[0] == 0:
+        edges = np.zeros((0, 2), dtype=np.int64)
+    else:
+        edges = enforce_degree_cap(n_nodes, cand_f, probs_f, deg_cap=int(deg_cap))
     if ensure_connected:
         edges = ensure_connected_by_candidates(n_nodes, edges, cand, probs)
     edges = np.unique(edges, axis=0)

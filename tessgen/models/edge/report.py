@@ -134,6 +134,29 @@ def make_report_and_figures(
         y_scale="log",
     )
 
+    # Preview metrics (if enabled during training)
+    if any("val/preview_mean_deg_pred" in r for r in hist):
+        deg_true = [float(r.get("val/preview_mean_deg_true", float("nan"))) for r in hist]
+        deg_pred = [float(r.get("val/preview_mean_deg_pred", float("nan"))) for r in hist]
+        save_line_plot(
+            out_path=str(figs / "preview_mean_degree.png"),
+            x=epochs,
+            ys={"val/preview_mean_deg_true": deg_true, "val/preview_mean_deg_pred": deg_pred},
+            title="Edge preview: mean degree",
+            xlabel="epoch",
+            ylabel="mean degree",
+        )
+    if any("val/preview_edge_ratio_mean" in r for r in hist):
+        ratio = [float(r.get("val/preview_edge_ratio_mean", float("nan"))) for r in hist]
+        save_line_plot(
+            out_path=str(figs / "preview_edge_ratio.png"),
+            x=epochs,
+            ys={"val/preview_edge_ratio_mean": ratio},
+            title="Edge preview: edge count ratio (pred/true)",
+            xlabel="epoch",
+            ylabel="ratio",
+        )
+
     probs = test_eval.pop("probs")
     labels = test_eval.pop("labels")
 
