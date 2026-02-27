@@ -100,21 +100,3 @@ class NodeDenoiser(nn.Module):
         vec = (x_t[dst] - x_t[src]) * w
         eps = scatter_sum(vec, dst, dim_size=N)  # (N,2)
         return eps
-
-
-class NPredictor(nn.Module):
-    """
-    Predict node count N from condition vector (RD + target metrics).
-    Outputs (mu, log_sigma) over log(N).
-    """
-
-    def __init__(self, *, cond_dim: int, d_h: int = 128, dropout: float = 0.0):
-        super().__init__()
-        self.net = mlp([cond_dim, d_h, d_h, 2], dropout=dropout)
-
-    def forward(self, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        out = self.net(cond)
-        mu = out[..., 0]
-        log_sigma = out[..., 1].clamp(-5.0, 3.0)
-        return mu, log_sigma
-

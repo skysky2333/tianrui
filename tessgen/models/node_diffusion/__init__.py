@@ -3,7 +3,6 @@ from .core import (
     DiffusionSchedule,
     NodeDenoiser,
     NodeDenoiserConfig,
-    NPredictor,
 )
 
 __all__ = [
@@ -11,6 +10,4 @@ __all__ = [
     "DiffusionSchedule",
     "NodeDenoiser",
     "NodeDenoiserConfig",
-    "NPredictor",
 ]
-

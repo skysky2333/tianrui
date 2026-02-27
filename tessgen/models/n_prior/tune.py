@@ -5,23 +5,17 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-import optuna
 import numpy as np
+import optuna
 import pandas as pd
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
 
-from .core import DiffusionConfig, NodeDenoiserConfig
-from .lit_module import NodeDiffusionLitModule
-from ...data import (
-    GraphStore,
-    TessellationRowDataset,
-    collate_first,
-    discover_graph_ids,
-    rows_for_graph_ids,
-    train_val_split_graph_ids,
-)
+from .core import NPriorConfig
+from .dataset import NPriorRowDataset
+from .lit_module import NPriorLitModule
+from ...data import discover_graph_ids, rows_for_graph_ids, train_val_split_graph_ids
 from ...pl_utils import lightning_device_from_arg
 from ...reporting import save_line_plot, write_json
 from ...scaler import StandardScaler
@@ -30,7 +24,7 @@ from ...utils import ensure_dir, set_seed
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Optuna tuning for node diffusion (Lightning)")
+    p = argparse.ArgumentParser(description="Optuna tuning for N prior (Lightning)")
     p.add_argument("--data_csv", type=str, required=True)
     p.add_argument("--tess_root", type=str, default="data/Tessellation_Dataset")
     p.add_argument("--cond_cols", type=str, nargs="+", required=True)
@@ -38,11 +32,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="auto")
-
-    p.add_argument("--k_nn", type=int, default=12)
-    p.add_argument("--steps", type=int, default=100)
-    p.add_argument("--beta_start", type=float, default=1e-4)
-    p.add_argument("--beta_end", type=float, default=2e-2)
+    p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--num_workers", type=int, default=4)
 
     p.add_argument("--max_epochs", type=int, default=3)
@@ -55,16 +45,10 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _fit_cond_scaler(df: pd.DataFrame, rows: list[int], *, tess_root: str, cond_cols: list[str], log_cols: set[str]) -> StandardScaler:
-    store = GraphStore(tess_root=tess_root)
-    graph_ids = sorted({(int(r) // 5) + 1 for r in rows})
-    logn_by_gid = {gid: float(np.log(float(store.get(gid).n_nodes))) for gid in graph_ids}
-
-    base = df.loc[rows, ["RD"] + cond_cols].to_numpy(dtype=np.float32)
-    logn = np.array([logn_by_gid[(int(r) // 5) + 1] for r in rows], dtype=np.float32).reshape(-1, 1)
-    x = np.concatenate([base[:, 0:1], logn, base[:, 1:]], axis=1)
+def _fit_x_scaler(df: pd.DataFrame, rows: list[int], cond_cols: list[str], log_cols: set[str]) -> StandardScaler:
+    x = df.loc[rows, ["RD"] + cond_cols].to_numpy(dtype=np.float32)
     x_t = torch.from_numpy(x)
-    x_t[:, 2:] = apply_log_cols_torch(x_t[:, 2:], cond_cols, log_cols)
+    x_t[:, 1:] = apply_log_cols_torch(x_t[:, 1:], cond_cols, log_cols)
     return StandardScaler.fit(x_t.numpy())
 
 
@@ -76,6 +60,9 @@ def main() -> None:
 
     cond_cols = list(args.cond_cols)
     log_cols = set(args.log_cols or [])
+    dev = lightning_device_from_arg(args.device)
+    num_workers = int(args.num_workers)
+    dl_kwargs = {"num_workers": num_workers, "persistent_workers": num_workers > 0, "pin_memory": dev.accelerator == "gpu"}
 
     graph_ids = discover_graph_ids(args.tess_root)
     train_g, val_g = train_val_split_graph_ids(graph_ids, val_frac=float(args.val_frac), seed=int(args.seed))
@@ -83,51 +70,29 @@ def main() -> None:
     df = pd.read_csv(args.data_csv)
     train_rows = rows_for_graph_ids(len(df), train_g)
     val_rows = rows_for_graph_ids(len(df), val_g)
-    cond_scaler = _fit_cond_scaler(df, train_rows, tess_root=args.tess_root, cond_cols=cond_cols, log_cols=log_cols)
+    scaler = _fit_x_scaler(df, train_rows, cond_cols, log_cols)
 
-    ds_train = TessellationRowDataset(
-        data_csv=args.data_csv,
-        tess_root=args.tess_root,
-        target_cols=["RS"],
-        cond_cols=cond_cols,
-        row_indices=train_rows,
-        cache_graphs=True,
-    )
-    ds_val = TessellationRowDataset(
-        data_csv=args.data_csv,
-        tess_root=args.tess_root,
-        target_cols=["RS"],
-        cond_cols=cond_cols,
-        row_indices=val_rows,
-        cache_graphs=True,
-    )
-
-    schedule_cfg = DiffusionConfig(n_steps=int(args.steps), beta_start=float(args.beta_start), beta_end=float(args.beta_end))
-    dev = lightning_device_from_arg(args.device)
-    num_workers = int(args.num_workers)
-    dl_kwargs = {"num_workers": num_workers, "persistent_workers": num_workers > 0, "pin_memory": dev.accelerator == "gpu"}
-    dl_train = DataLoader(ds_train, batch_size=1, shuffle=True, collate_fn=collate_first, **dl_kwargs)
-    dl_val = DataLoader(ds_val, batch_size=1, shuffle=False, collate_fn=collate_first, **dl_kwargs)
+    ds_train = NPriorRowDataset(data_csv=args.data_csv, tess_root=args.tess_root, cond_cols=cond_cols, row_indices=train_rows)
+    ds_val = NPriorRowDataset(data_csv=args.data_csv, tess_root=args.tess_root, cond_cols=cond_cols, row_indices=val_rows)
+    dl_train = DataLoader(ds_train, batch_size=int(args.batch_size), shuffle=True, **dl_kwargs)
+    dl_val = DataLoader(ds_val, batch_size=int(args.batch_size), shuffle=False, **dl_kwargs)
 
     def objective(trial: optuna.Trial) -> float:
-        den_cfg = NodeDenoiserConfig(
-            cond_dim=2 + len(cond_cols),
+        cfg = NPriorConfig(
             d_h=trial.suggest_categorical("d_h", [64, 96, 128, 160, 192]),
             n_layers=trial.suggest_int("n_layers", 2, 5),
-            n_rbf=trial.suggest_categorical("n_rbf", [8, 16, 24]),
             dropout=trial.suggest_float("dropout", 0.0, 0.2),
+            sigma_min=0.7,
         )
         lr = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
         wd = trial.suggest_float("weight_decay", 1e-4, 5e-2, log=True)
 
-        lit = NodeDiffusionLitModule(
-            denoiser_cfg=asdict(den_cfg),
-            schedule_cfg=asdict(schedule_cfg),
+        lit = NPriorLitModule(
+            cfg=asdict(cfg),
             cond_cols=cond_cols,
             log_cols=sorted(log_cols),
-            cond_scaler_mean=cond_scaler.mean.tolist(),
-            cond_scaler_std=cond_scaler.std.tolist(),
-            k_nn=int(args.k_nn),
+            scaler_mean=scaler.mean.tolist(),
+            scaler_std=scaler.std.tolist(),
             lr=float(lr),
             weight_decay=float(wd),
         )
@@ -142,7 +107,7 @@ def main() -> None:
             limit_val_batches=float(args.limit_val_batches),
         )
         trainer.fit(lit, train_dataloaders=dl_train, val_dataloaders=dl_val)
-        val = trainer.callback_metrics["val/loss"]
+        val = trainer.callback_metrics["val/nll"]
         val_f = float(val.detach().cpu().item() if isinstance(val, torch.Tensor) else val)
         del trainer
         del lit
@@ -164,22 +129,20 @@ def main() -> None:
     save_line_plot(
         out_path=str(Path(args.out_dir) / "optuna_history.png"),
         x=xs,
-        ys={"val/loss": [float(v) for v in values]},
-        title="Optuna tuning history (node diffusion)",
+        ys={"val/nll": [float(v) for v in values]},
+        title="Optuna tuning history (n prior)",
         xlabel="trial",
-        ylabel="val loss",
+        ylabel="val nll",
     )
 
     cfg_out = {
-        "task": "node_diffusion_tune",
+        "task": "n_prior_tune",
         "data_csv": args.data_csv,
         "tess_root": args.tess_root,
         "cond_cols": cond_cols,
         "log_cols": sorted(log_cols),
         "val_frac": float(args.val_frac),
         "device": {"accelerator": dev.accelerator, "devices": dev.devices},
-        "k_nn": int(args.k_nn),
-        "schedule_cfg": asdict(schedule_cfg),
         "n_trials": int(args.n_trials),
         "timeout_sec": int(args.timeout_sec),
         "max_epochs": int(args.max_epochs),
@@ -195,3 +158,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

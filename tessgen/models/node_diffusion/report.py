@@ -7,7 +7,7 @@ import torch
 
 from .lit_module import NodeDiffusionLitModule
 from ...graph_utils import knn_candidate_pairs, pairs_to_edge_index
-from ...reporting import read_jsonl, save_histogram, save_line_plot, save_scatter_plot, write_json
+from ...reporting import read_jsonl, save_bar_plot_both, save_line_plot, write_json
 
 
 def _safe_mean(xs: list[float]) -> float:
@@ -24,11 +24,7 @@ def eval_node_diffusion(
     lit.eval()
     losses = []
     diffs = []
-    nlls = []
-    logn_err = []
-    n_abs_err = []
-    n_true_all = []
-    n_pred_all = []
+    n_all = []
 
     for i, sample in enumerate(dl):
         if max_samples and i >= int(max_samples):
@@ -36,17 +32,6 @@ def eval_node_diffusion(
         coords0_cpu = sample["coords01"]
         N = int(coords0_cpu.shape[0])
         cond_z = lit._cond_to_z(sample)  # noqa: SLF001
-
-        logN = float(np.log(max(1.0, float(N))))
-        mu, _ = lit.n_pred(cond_z)
-        mu_f = float(mu.detach().cpu().item())
-        n_hat = int(round(float(np.exp(mu_f))))
-
-        # Compute diffusion loss + NLL on a random timestep, matching training objective
-        logN_t = torch.log(torch.tensor(float(N), device=lit.device))
-        mu_t, log_sigma_t = lit.n_pred(cond_z)
-        sigma2 = torch.exp(2.0 * log_sigma_t)
-        nll = 0.5 * (logN_t - mu_t) ** 2 / sigma2 + log_sigma_t
 
         t = torch.randint(low=0, high=lit.schedule.n_steps, size=(1,), device=lit.device, dtype=torch.long)
         eps_cpu = torch.randn_like(coords0_cpu)
@@ -59,28 +44,19 @@ def eval_node_diffusion(
         eps_pred = lit.denoiser(x_t=x_t, t=t, cond=cond_z, edge_index=edge_index)
         diff_loss = torch.mean((eps_pred - eps) ** 2)
 
-        loss = diff_loss + lit.lambda_n * nll.mean()
+        loss = diff_loss
         losses.append(float(loss.detach().cpu()))
         diffs.append(float(diff_loss.detach().cpu()))
-        nlls.append(float(nll.mean().detach().cpu()))
-
-        logn_err.append(mu_f - logN)
-        n_abs_err.append(float(abs(n_hat - N)))
-        n_true_all.append(float(N))
-        n_pred_all.append(float(n_hat))
+        n_all.append(float(N))
 
     return {
         "samples": int(min(len(dl), int(max_samples)) if max_samples else len(dl)),
         "loss_mean": _safe_mean(losses),
         "diff_mse_mean": _safe_mean(diffs),
-        "nll_mean": _safe_mean(nlls),
-        "n_pred": {
-            "n_mae": _safe_mean(n_abs_err),
-            "logn_err_mean": float(np.mean(logn_err)) if logn_err else float("nan"),
-            "logn_err_std": float(np.std(logn_err)) if logn_err else float("nan"),
-            "n_true": n_true_all,
-            "n_pred": n_pred_all,
-            "logn_err": logn_err,
+        "n_nodes": {
+            "mean": float(np.mean(n_all)) if n_all else float("nan"),
+            "min": float(np.min(n_all)) if n_all else float("nan"),
+            "max": float(np.max(n_all)) if n_all else float("nan"),
         },
     }
 
@@ -132,26 +108,33 @@ def make_report_and_figures(*, run_dir: str, history_path: str, test_eval: dict,
         y_scale="log",
     )
 
-    n_true = test_eval["n_pred"].pop("n_true")
-    n_pred = test_eval["n_pred"].pop("n_pred")
-    logn_err = test_eval["n_pred"].pop("logn_err")
-
-    if n_true:
-        save_scatter_plot(
-            out_path=str(figs / "n_true_vs_pred.png"),
-            x=[float(x) for x in n_true],
-            y=[float(y) for y in n_pred],
-            title="Node count: true vs predicted",
-            xlabel="true N",
-            ylabel="pred N",
+    cycle_series = {}
+    for k in ["val/cycle_r_true_graph", "val/cycle_r_single", "val/cycle_r_best"]:
+        if any(k in r for r in hist):
+            cycle_series[k] = [float(r.get(k, float("nan"))) for r in hist]
+    if cycle_series:
+        save_line_plot(
+            out_path=str(figs / "cycle_r_over_epoch.png"),
+            x=epochs,
+            ys=cycle_series,
+            title="Cycle eval Pearson r (validation)",
+            xlabel="epoch",
+            ylabel="pearson_r",
         )
-    if logn_err:
-        save_histogram(
-            out_path=str(figs / "logn_error_hist.png"),
-            values=[float(x) for x in logn_err],
-            title="log(N) prediction error",
-            xlabel="mu - log(N)",
-            bins=60,
+
+    if cycle_eval is not None:
+        m = cycle_eval["metrics"]
+        labels = ["true_graph", "single", "best"]
+        rs = [float(m[k]["pearson_r"]) for k in labels]
+        save_bar_plot_both(
+            out_png=str(figs / "cycle_pearson_r.png"),
+            out_svg=str(figs / "cycle_pearson_r.svg"),
+            labels=labels,
+            values=rs,
+            title="Cycle eval Pearson r (RS)",
+            xlabel="mode",
+            ylabel="pearson_r",
+            y_lim=(-1.0, 1.0),
         )
 
     report = {"task": "node_diffusion", "test": test_eval, "figures_dir": str(figs)}

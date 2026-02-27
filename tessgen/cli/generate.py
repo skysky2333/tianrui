@@ -8,13 +8,15 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
-from ..ckpt import load_edge_model, load_node_diffusion, load_surrogate
+from ..ckpt import load_edge_model, load_n_prior, load_node_diffusion, load_surrogate
 from ..constants import COORD_MIN, COORD_RANGE
 from ..data import undirected_to_directed_edge_index
-from ..generation import ddpm_sample_coords, sample_edges_from_coords, sample_node_count
+from ..generation import ddpm_sample_coords, sample_edges_from_coords
+from ..n_select import clamp_and_unique, sample_n_candidates_from_prior
 from ..transforms import apply_log_cols_torch, invert_log_cols_torch
-from ..utils import Batch, device_from_arg, ensure_dir, format_progress_bar, set_seed
+from ..utils import Batch, device_from_arg, ensure_dir, set_seed
 from ..viz import save_graph_figure
 
 
@@ -44,12 +46,15 @@ def _parse_args() -> argparse.Namespace:
         help="Candidate RD values used when --rd is omitted.",
     )
     p.add_argument("--cond", type=str, nargs="*", default=[], help="Condition values as KEY=VALUE, e.g. RS=0.01")
-    p.add_argument("--k", type=int, default=8, help="How many samples to draw (per RD when searching)")
-    p.add_argument("--k_per_rd", type=int, default=0, help="Samples per RD when searching (0 = use --k)")
+    p.add_argument("--k", type=int, default=2, help="Samples per (RD, N) combination")
     p.add_argument("--top_m", type=int, default=3, help="How many best samples to save")
     p.add_argument("--deg_cap", type=int, default=12)
     p.add_argument("--min_n", type=int, default=64)
     p.add_argument("--max_n", type=int, default=5000)
+    p.add_argument("--n_nodes", type=int, default=None, help="If set, fix the number of nodes N.")
+    p.add_argument("--n_candidates", type=int, nargs="*", default=[], help="Candidate N values to search over.")
+    p.add_argument("--n_prior_ckpt", type=str, default="", help="NPrior checkpoint used to sample candidate N values.")
+    p.add_argument("--n_prior_samples", type=int, default=12, help="How many N candidates to sample from NPrior (per RD).")
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--seed", type=int, default=0)
 
@@ -71,6 +76,11 @@ def main() -> None:
     surrogate = load_surrogate(args.surrogate_ckpt, device=device)
     node_bundle = load_node_diffusion(args.node_ckpt, device=device)
     edge_bundle = load_edge_model(args.edge_ckpt, device=device)
+    n_prior = None
+    if args.n_nodes is None and not list(args.n_candidates):
+        if not str(args.n_prior_ckpt):
+            raise SystemExit("Provide --n_nodes, --n_candidates, or --n_prior_ckpt for automatic N selection.")
+        n_prior = load_n_prior(args.n_prior_ckpt, device=device)
 
     # Validate required condition keys
     for c in node_bundle.cond_cols:
@@ -79,22 +89,34 @@ def main() -> None:
     for c in surrogate.target_cols:
         if c not in cond_dict:
             raise SystemExit(f"Missing required target {c} for scoring. Provide via --cond {c}=...")
+    if n_prior is not None:
+        for c in n_prior.cond_cols:
+            if c not in cond_dict:
+                raise SystemExit(f"Missing required NPrior condition {c}. Provide via --cond {c}=...")
 
     # RD grid (either fixed, or search over candidates)
     if args.rd is not None:
         rd_values = [float(args.rd)]
-        k_per_rd = int(args.k)
     else:
         rd_values = [float(x) for x in list(args.rd_candidates)]
         if not rd_values:
             raise SystemExit("No RD provided: pass --rd, or provide at least one value in --rd_candidates.")
-        k_per_rd = int(args.k_per_rd) if int(args.k_per_rd) > 0 else int(args.k)
-        if k_per_rd <= 0:
-            raise SystemExit("--k (and --k_per_rd) must be >= 1")
+    k_per_combo = int(args.k)
+    if k_per_combo <= 0:
+        raise SystemExit("--k must be >= 1")
 
     # Condition values (metrics) for node diffusion: cond_cols
     cond_vals = torch.tensor([[float(cond_dict[c]) for c in node_bundle.cond_cols]], device=device, dtype=torch.float32)
     cond_vals = apply_log_cols_torch(cond_vals, node_bundle.cond_cols, node_bundle.log_cols)
+
+    # Raw condition values for NPrior (if used)
+    cond_vals_prior_raw = None
+    if n_prior is not None:
+        cond_vals_prior_raw = torch.tensor(
+            [[float(cond_dict[c]) for c in n_prior.cond_cols]],
+            device=device,
+            dtype=torch.float32,
+        )
 
     # Target vector for surrogate scoring (standardized, in surrogate training space)
     y_target = torch.tensor([[float(cond_dict[c]) for c in surrogate.target_cols]], device=device, dtype=torch.float32)
@@ -102,73 +124,115 @@ def main() -> None:
     y_target_z = surrogate.scaler.transform_torch(y_target_t)
 
     results = []
-    total = int(len(rd_values) * int(k_per_rd))
-    if total <= 0:
-        raise RuntimeError("Internal error: total samples must be > 0")
-    t0 = time.time()
-    done = 0
+    total = 0
+    n_values_per_rd: dict[float, list[int]] = {}
     for rd in rd_values:
-        # Standardized condition vector for node diffusion: [RD] + cond_cols
-        rd_t = torch.tensor([[float(rd)]], device=device, dtype=torch.float32)
-        full = torch.cat([rd_t, cond_vals], dim=-1)  # (1, 1+Dc)
-        cond_z = node_bundle.cond_scaler.transform_torch(full).squeeze(0)
-
-        for _ in range(int(k_per_rd)):
-            n_nodes = sample_node_count(node_bundle.n_pred, cond_z, min_n=int(args.min_n), max_n=int(args.max_n))
-            coords01 = ddpm_sample_coords(
-                schedule=node_bundle.schedule,
-                denoiser=node_bundle.denoiser,
-                cond_z=cond_z,
-                n_nodes=n_nodes,
-                k_nn=node_bundle.k_nn,
+        if args.n_nodes is not None:
+            n_values = [int(args.n_nodes)]
+        elif list(args.n_candidates):
+            n_values = clamp_and_unique([int(x) for x in list(args.n_candidates)], min_n=int(args.min_n), max_n=int(args.max_n))
+        else:
+            if n_prior is None or cond_vals_prior_raw is None:
+                raise RuntimeError("Internal error: NPrior expected but not loaded")
+            n_values = sample_n_candidates_from_prior(
+                n_prior,
+                rd=float(rd),
+                cond_vals_raw=cond_vals_prior_raw,
+                n_samples=int(args.n_prior_samples),
+                min_n=int(args.min_n),
+                max_n=int(args.max_n),
                 device=device,
             )
-            edges_uv = sample_edges_from_coords(
-                edge_model=edge_bundle.model,
-                coords01=coords01,
-                k=edge_bundle.k,
-                deg_cap=int(args.deg_cap),
-                ensure_connected=True,
-                device=device,
-            )
-            edge_index = undirected_to_directed_edge_index(edges_uv)
-            batch = Batch(
-                x=coords01,
-                edge_index=edge_index.to(device),
-                batch=torch.zeros((n_nodes,), device=device, dtype=torch.long),
-                rd=rd_t,
-                y=y_target_z,
-                n_nodes=torch.tensor([n_nodes], device=device, dtype=torch.long),
-                n_edges=torch.tensor([int(edges_uv.shape[0])], device=device, dtype=torch.long),
-            )
+        if not n_values:
+            raise RuntimeError("No N candidates produced")
+        n_values_per_rd[float(rd)] = n_values
+        total += int(len(n_values) * int(k_per_combo))
 
-            with torch.no_grad():
-                pred_z = surrogate.model(batch)
-                err = torch.mean((pred_z - y_target_z) ** 2).item()
-                pred_t = surrogate.scaler.inverse_transform_torch(pred_z)
-                pred = (
-                    invert_log_cols_torch(pred_t, surrogate.target_cols, surrogate.log_cols)
-                    .squeeze(0)
-                    .detach()
-                    .cpu()
-                    .numpy()
-                )
+    with tqdm(
+        total=int(total),
+        desc="generate",
+        file=sys.stderr,
+        dynamic_ncols=True,
+        leave=True,
+    ) as pbar:
+        for rd in rd_values:
+            n_values = n_values_per_rd[float(rd)]
+            for n_nodes in n_values:
+                rd_t = torch.tensor([[float(rd)]], device=device, dtype=torch.float32)
+                logn_t = torch.tensor([[float(np.log(float(n_nodes)))]], device=device, dtype=torch.float32)
+                full = torch.cat([rd_t, logn_t, cond_vals], dim=-1)  # (1, 2+Dc)
+                cond_z = node_bundle.cond_scaler.transform_torch(full).squeeze(0)
 
-            results.append(
-                {
-                    "err": float(err),
-                    "rd": float(rd),
-                    "n_nodes": int(n_nodes),
-                    "n_edges": int(edges_uv.shape[0]),
-                    "coords01": coords01.detach().cpu().numpy(),
-                    "edges_uv": edges_uv,
-                    "pred": {c: float(pred[i]) for i, c in enumerate(surrogate.target_cols)},
-                }
-            )
-            done += 1
-            msg = format_progress_bar(done=done, total=total, start_time=t0, prefix="generate")
-            end = "\n" if done == total else "\r"
-            print(msg, end=end, file=sys.stderr, flush=True)
+                for _ in range(int(k_per_combo)):
+                    pbar.set_postfix_str(f"step=ddpm rd={rd:.4g} N={int(n_nodes)}", refresh=True)
+                    t_ddpm0 = time.perf_counter()
+                    coords01 = ddpm_sample_coords(
+                        schedule=node_bundle.schedule,
+                        denoiser=node_bundle.denoiser,
+                        cond_z=cond_z,
+                        n_nodes=int(n_nodes),
+                        k_nn=node_bundle.k_nn,
+                        device=device,
+                    )
+                    t_ddpm = float(time.perf_counter() - t_ddpm0)
+
+                    pbar.set_postfix_str(f"step=edge rd={rd:.4g} N={int(n_nodes)} ddpm={t_ddpm:.3g}s", refresh=True)
+                    t_edge0 = time.perf_counter()
+                    edges_uv = sample_edges_from_coords(
+                        edge_model=edge_bundle.model,
+                        coords01=coords01,
+                        k=edge_bundle.k,
+                        deg_cap=int(args.deg_cap),
+                        ensure_connected=True,
+                        device=device,
+                    )
+                    t_edge = float(time.perf_counter() - t_edge0)
+
+                    edge_index = undirected_to_directed_edge_index(edges_uv)
+                    batch = Batch(
+                        x=coords01,
+                        edge_index=edge_index.to(device),
+                        batch=torch.zeros((int(n_nodes),), device=device, dtype=torch.long),
+                        rd=rd_t,
+                        y=y_target_z,
+                        n_nodes=torch.tensor([int(n_nodes)], device=device, dtype=torch.long),
+                        n_edges=torch.tensor([int(edges_uv.shape[0])], device=device, dtype=torch.long),
+                    )
+
+                    pbar.set_postfix_str(
+                        f"step=surrogate rd={rd:.4g} N={int(n_nodes)} ddpm={t_ddpm:.3g}s edge={t_edge:.3g}s",
+                        refresh=True,
+                    )
+                    t_sur0 = time.perf_counter()
+                    pred_z = surrogate.model(batch)
+                    err = torch.mean((pred_z - y_target_z) ** 2).item()
+                    pred_t = surrogate.scaler.inverse_transform_torch(pred_z)
+                    pred = (
+                        invert_log_cols_torch(pred_t, surrogate.target_cols, surrogate.log_cols)
+                        .squeeze(0)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    t_sur = float(time.perf_counter() - t_sur0)
+
+                    results.append(
+                        {
+                            "err": float(err),
+                            "rd": float(rd),
+                            "n_nodes": int(n_nodes),
+                            "n_edges": int(edges_uv.shape[0]),
+                            "coords01": coords01.detach().cpu().numpy(),
+                            "edges_uv": edges_uv,
+                            "pred": {c: float(pred[i]) for i, c in enumerate(surrogate.target_cols)},
+                        }
+                    )
+
+                    pbar.set_postfix_str(
+                        f"step=done rd={rd:.4g} N={int(n_nodes)} ddpm={t_ddpm:.3g}s edge={t_edge:.3g}s sur={t_sur:.3g}s err_mse_z={err:.3g}",
+                        refresh=True,
+                    )
+                    pbar.update(1)
 
     results.sort(key=lambda d: d["err"])
     keep = results[: int(args.top_m)]
@@ -210,7 +274,10 @@ def main() -> None:
             edges_uv=r["edges_uv"],
             out_png=str(fig_png),
             out_svg=str(fig_svg),
-            title=f"gen {i} | rd={r['rd']:.4g} | err_mse_z={r['err']:.3g} | N={r['n_nodes']} E={r['n_edges']}",
+            title=(
+                f"gen {i} | rd={r['rd']:.4g} N={r['n_nodes']} E={r['n_edges']} err_mse_z={r['err']:.3g}\n"
+                f"RS_true={cond_dict.get('RS', float('nan')):.4g} RS_pred={r['pred'].get('RS', float('nan')):.4g}"
+            ),
         )
 
     best_rd = keep[0]["rd"] if keep else None
@@ -223,7 +290,11 @@ def main() -> None:
                 "best_rd": float(best_rd) if best_rd is not None else None,
                 "rd_search": args.rd is None,
                 "rd_candidates": rd_values if args.rd is None else None,
-                "k_per_rd": int(k_per_rd) if args.rd is None else None,
+                "k_per_combo": int(k_per_combo),
+                "n_nodes": int(args.n_nodes) if args.n_nodes is not None else None,
+                "n_candidates": [int(x) for x in list(args.n_candidates)] if list(args.n_candidates) else None,
+                "n_prior_ckpt": str(args.n_prior_ckpt) if str(args.n_prior_ckpt) else None,
+                "n_prior_samples": int(args.n_prior_samples) if str(args.n_prior_ckpt) else None,
             }
         )
     )

@@ -6,3 +6,6 @@ tessgen/__pycache__/
 tessgen/cli/__pycache__/
 tessgen/models/node_diffusion/__pycache__/
 tessgen/models/__pycache__/
+tessgen/models/n_prior/__pycache__/
+tessgen/models/surrogate/__pycache__/
+tessgen/models/edge/__pycache__/

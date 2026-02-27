@@ -189,3 +189,40 @@ def save_histogram_both(
     plt.savefig(out_png, dpi=int(dpi))
     plt.savefig(out_svg)
     plt.close()
+
+
+def save_bar_plot_both(
+    *,
+    out_png: str,
+    out_svg: str,
+    labels: list[str],
+    values: list[float],
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    y_lim: tuple[float, float] | None = None,
+    dpi: int = 160,
+) -> None:
+    mpl_setup()
+    import matplotlib.pyplot as plt
+
+    if len(labels) != len(values):
+        raise ValueError("labels and values must have the same length")
+
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_svg).parent.mkdir(parents=True, exist_ok=True)
+
+    xs = list(range(len(labels)))
+    plt.figure(figsize=(6.0, 4.0))
+    plt.bar(xs, values, alpha=0.85)
+    plt.xticks(xs, labels)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    if y_lim is not None:
+        plt.ylim(float(y_lim[0]), float(y_lim[1]))
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=int(dpi))
+    plt.savefig(out_svg)
+    plt.close()

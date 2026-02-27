@@ -6,7 +6,8 @@ import numpy as np
 import torch
 
 from .edge_model import EdgeModel, EdgeModelConfig
-from .node_diffusion import DiffusionConfig, DiffusionSchedule, NodeDenoiser, NodeDenoiserConfig, NPredictor
+from .n_prior import NPriorConfig, NPriorModel
+from .node_diffusion import DiffusionConfig, DiffusionSchedule, NodeDenoiser, NodeDenoiserConfig
 from .scaler import StandardScaler
 from .surrogate import SurrogateConfig, SurrogateModel
 
@@ -48,9 +49,28 @@ def load_edge_model(ckpt_path: str, *, device: torch.device) -> EdgeBundle:
 
 
 @dataclass(frozen=True)
+class NPriorBundle:
+    model: NPriorModel
+    cond_cols: list[str]
+    log_cols: set[str]
+    scaler: StandardScaler
+
+
+def load_n_prior(ckpt_path: str, *, device: torch.device) -> NPriorBundle:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    cfg = NPriorConfig(**ckpt["cfg"])
+    cond_cols = list(ckpt["cond_cols"])
+    log_cols = set(ckpt["log_cols"])
+    scaler = StandardScaler(mean=np.array(ckpt["scaler_mean"], dtype=np.float32), std=np.array(ckpt["scaler_std"], dtype=np.float32))
+    model = NPriorModel(x_dim=1 + len(cond_cols), cfg=cfg).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    return NPriorBundle(model=model, cond_cols=cond_cols, log_cols=log_cols, scaler=scaler)
+
+
+@dataclass(frozen=True)
 class NodeDiffusionBundle:
     denoiser: NodeDenoiser
-    n_pred: NPredictor
     schedule: DiffusionSchedule
     cond_cols: list[str]
     log_cols: set[str]
@@ -66,9 +86,6 @@ def load_node_diffusion(ckpt_path: str, *, device: torch.device) -> NodeDiffusio
     denoiser = NodeDenoiser(den_cfg).to(device)
     denoiser.load_state_dict(ckpt["denoiser_state"])
     denoiser.eval()
-    n_pred = NPredictor(cond_dim=den_cfg.cond_dim, d_h=den_cfg.d_h, dropout=float(den_cfg.dropout)).to(device)
-    n_pred.load_state_dict(ckpt["n_pred_state"])
-    n_pred.eval()
     cond_cols = list(ckpt["cond_cols"])
     log_cols = set(ckpt["log_cols"])
     cond_scaler = StandardScaler(
@@ -78,7 +95,6 @@ def load_node_diffusion(ckpt_path: str, *, device: torch.device) -> NodeDiffusio
     k_nn = int(ckpt["k_nn"])
     return NodeDiffusionBundle(
         denoiser=denoiser,
-        n_pred=n_pred,
         schedule=schedule,
         cond_cols=cond_cols,
         log_cols=log_cols,

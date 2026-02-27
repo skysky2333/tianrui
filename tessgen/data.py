@@ -246,6 +246,7 @@ class TessellationRowDataset(Dataset):
         rd = float(r["RD"])
         y = np.array([float(r[c]) for c in self.target_cols], dtype=np.float32)
         cond = np.array([float(r[c]) for c in self.cond_cols], dtype=np.float32)
+        logn = float(math.log(float(g.n_nodes)))
 
         return {
             "graph_id": graph_id,
@@ -253,6 +254,7 @@ class TessellationRowDataset(Dataset):
             "edge_index": g.edge_index,  # torch long (2, 2E)
             "edges_undirected": g.edges_undirected,  # torch long (E, 2)
             "rd": torch.tensor([rd], dtype=torch.float32),
+            "logn": torch.tensor([logn], dtype=torch.float32),
             "y": torch.from_numpy(y),
             "cond": torch.from_numpy(cond),
         }

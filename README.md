@@ -5,6 +5,10 @@ This repo contains a small deep-learning framework to **generate tessellation-st
 - `RD` (either user-specified, or inferred by searching over a candidate list), and
 - target simulation metrics `y` (at minimum `RS`, optionally more columns from `data/Data_1.csv` or `data/Data_2.csv`).
 
+The node diffusion model is **explicitly conditioned on node count** via `logN`, so generation can control `N` directly.
+If the user does not provide `N`, a separate **NPrior** model can propose a broad distribution of plausible `N` values
+conditioned on `(RD, metrics)`.
+
 The dataset lives in:
 
 - `data/Tessellation_Dataset/Node_<n>.txt`
@@ -77,7 +81,24 @@ Outputs in `runs/edge/`:
 - `config.json`, `history.jsonl`, `report.json`
 - `figures/` (loss curve, PR/ROC curves, probability histograms; includes `loss_bce_logy.png`)
 
-4) Train a node diffusion model (condition → coords):
+4) Train an N prior (RD + metrics → log(N)):
+
+```bash
+conda run -n tianrui python -m tessgen.cli.train_n_prior \
+  --data_csv data/Data_2.csv \
+  --cond_cols RS \
+  --epochs 16 \
+  --out_dir runs/n_prior \
+  --device cpu
+```
+
+Outputs in `runs/n_prior/`:
+- `n_prior.pt` (inference artifact used by `tessgen.cli.generate` when `--n_nodes` is omitted)
+- `best.ckpt` / `last.ckpt` (Lightning checkpoints)
+- `config.json`, `history.jsonl`, `report.json`
+- `figures/` (NLL curves + log(N) scatter/hist)
+
+5) Train a node diffusion model (RD + logN + metrics → coords):
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
@@ -89,36 +110,46 @@ conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
 ```
 
 Optional: run an end-to-end cycle benchmark (metrics → graph → surrogate → metrics) on the diffusion **test split** at the
-end of training:
+end of training. By default, when cycle checkpoints are provided, an additional **validation cycle eval** also runs at the
+end of **every epoch** and `best.ckpt` is selected by `val/cycle_r_best`:
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
   --data_csv data/Data_2.csv \
   --cond_cols RS \
-  --epochs 8 \
+  --epochs 16 \
   --out_dir runs/node_diffusion \
   --device cpu \
   --cycle_surrogate_ckpt runs/surrogate/surrogate.pt \
   --cycle_edge_ckpt runs/edge/edge_model.pt \
-  --cycle_k_best 8
+  --cycle_k_best 8 \
+  --cycle_epoch_rows 10
 ```
+
+To disable the per-epoch validation cycle eval (and monitor `val/loss` instead), add `--no-cycle_each_epoch`.
 
 Outputs in `runs/node_diffusion/`:
 - `node_diffusion.pt` (inference artifact)
 - `best.ckpt` / `last.ckpt` (Lightning checkpoints)
 - `config.json`, `history.jsonl`, `report.json`
-- `figures/` (loss curves + node-count prediction plots; includes `loss_symlog.png` and `diff_mse_logy.png`)
+- `figures/` (loss curves; includes `loss_symlog.png` and `diff_mse_logy.png`)
 
 If cycle eval is enabled, additional outputs are written in `runs/node_diffusion/cycle/` and the diffusion `report.json`
 includes `test.cycle.metrics.*` (Pearson/Spearman, MAE/RMSE, R²) for both single-sample and best-of-k.
+The diffusion run also includes `figures/cycle_pearson_r.(png|svg)`.
 
-5) Generate K candidate graphs for a target `(RD, RS)`:
+If per-epoch cycle eval is enabled (default when cycle ckpts are provided), outputs are written under:
+- `runs/node_diffusion/cycle_val/epoch_###/`
+and `figures/cycle_r_over_epoch.png` is generated from `history.jsonl`.
+
+6) Generate candidate graphs for a target `(RD, RS)`:
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.generate \
   --rd 0.10 \
   --cond RS=0.01 \
-  --k 8 \
+  --n_nodes 1024 \
+  --k 4 \
   --surrogate_ckpt runs/surrogate/surrogate.pt \
   --node_ckpt runs/node_diffusion/node_diffusion.pt \
   --edge_ckpt runs/edge/edge_model.pt \
@@ -129,18 +160,21 @@ conda run -n tianrui python -m tessgen.cli.generate \
 Notes:
 - The generator is **stochastic**: use `--k` to sample multiple candidates and select by surrogate score.
 - Conditioning on **more than RS** will generally produce tighter, more identifiable generations.
+- If you omit `--n_nodes`, provide either `--n_candidates` (grid search) or `--n_prior_ckpt` (sample candidate N values).
 
-6) (Optional) Infer `RD` given only metrics (e.g. only `RS`):
+7) (Optional) Infer `RD` given only metrics (e.g. only `RS`):
 
 If you omit `--rd`, the generator will search over `--rd_candidates` (defaults to `0.01 0.05 0.1 0.15 0.2`) and pick
-the best sample by surrogate score. When searching, `--k` is interpreted as **samples per RD** (total samples =
-`len(rd_candidates) * k`). The chosen `RD` is written to `meta_*.json` and printed as `best_rd`.
+the best sample by surrogate score. When searching, `--k` is interpreted as **samples per (RD, N) combination**.
+The chosen `RD` is written to `meta_*.json` and printed as `best_rd`.
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.generate \
   --cond RS=0.01 \
   --rd_candidates 0.01 0.05 0.1 0.15 0.2 \
-  --k 4 \
+  --n_prior_ckpt runs/n_prior/n_prior.pt \
+  --n_prior_samples 12 \
+  --k 2 \
   --surrogate_ckpt runs/surrogate/surrogate.pt \
   --node_ckpt runs/node_diffusion/node_diffusion.pt \
   --edge_ckpt runs/edge/edge_model.pt \
@@ -149,7 +183,7 @@ conda run -n tianrui python -m tessgen.cli.generate \
 
 ```
 
-7) End-to-end benchmark on the test split (metrics → graph → surrogate → metrics):
+8) End-to-end benchmark on the test split (metrics → graph → surrogate → metrics):
 
 This evaluates the full pipeline by taking test-set metrics (e.g. `RS`) + true `RD`, generating a graph with the
 node diffusion + edge model, then predicting metrics with the surrogate and benchmarking correlation/error vs the
@@ -169,7 +203,7 @@ Outputs in `out/bench_cycle/`:
 - `report.json` (Pearson/Spearman, MAE/RMSE, R² for both single-sample and best-of-k)
 - `rows.jsonl` (per-row predictions/errors)
 - `figures/` (summary scatter + error hist, PNG+SVG)
-- `graphs_single/`, `graphs_best/` (per-row graph visualizations, PNG+SVG)
+- `graphs_true/`, `graphs_single/`, `graphs_best/` (per-row graph visualizations, PNG+SVG; titles include RS_true/RS_pred)
 
 
 ## Hyperparameter tuning (Optuna)
@@ -201,6 +235,15 @@ conda run -n tianrui python -m tessgen.cli.tune_node_diffusion \
   --out_dir runs/tune_node_diffusion
 ```
 
+N prior:
+
+```bash
+conda run -n tianrui python -m tessgen.cli.tune_n_prior \
+  --data_csv data/Data_2.csv \
+  --cond_cols RS \
+  --out_dir runs/tune_n_prior
+```
+
 Each tuning run writes `trials.csv`, `best.json`, `optuna_history.png`, and `config.json`.
 
 ## Code layout
@@ -208,6 +251,7 @@ Each tuning run writes `trials.csv`, `best.json`, `optuna_history.png`, and `con
 - `tessgen/models/surrogate/`: surrogate model + Lightning trainer + Optuna tuner + reports
 - `tessgen/models/edge/`: edge model + Lightning trainer + Optuna tuner + reports
 - `tessgen/models/node_diffusion/`: node diffusion model + Lightning trainer + Optuna tuner + reports
+- `tessgen/models/n_prior/`: N prior model + Lightning trainer + Optuna tuner + reports
 
 ## Acknowledgement
 

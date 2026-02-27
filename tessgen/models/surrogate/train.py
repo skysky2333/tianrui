@@ -27,7 +27,7 @@ from ...pl_callbacks import EmptyCacheCallback, JsonlMetricsCallback
 from ...pl_utils import lightning_device_from_arg
 from ...scaler import StandardScaler
 from ...transforms import apply_log_cols_torch
-from ...utils import ensure_dir, set_seed
+from ...utils import device_from_arg, ensure_dir, set_seed
 
 
 def _parse_args() -> argparse.Namespace:
@@ -178,8 +178,8 @@ def main() -> None:
     )
 
     # Comprehensive report + figures on test set
-    device = torch.device("cuda" if dev.accelerator == "gpu" else dev.accelerator)
-    y_true, y_pred, mse_z_eval = predict_on_loader(lit=best_lit, dl=dl_test, device=device)
+    torch_device = device_from_arg(args.device)
+    y_true, y_pred, mse_z_eval = predict_on_loader(lit=best_lit, dl=dl_test, device=torch_device)
     make_report_and_figures(
         run_dir=args.out_dir,
         history_path=history_path,

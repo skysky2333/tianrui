@@ -4,5 +4,5 @@ __all__ = [
     "surrogate",
     "edge_model",
     "node_diffusion",
+    "n_prior",
 ]
-

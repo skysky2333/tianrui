@@ -14,11 +14,13 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader
 
 from .core import DiffusionConfig, NodeDenoiserConfig
+from .cycle_callback import CycleEvalEveryEpochCallback, node_bundle_from_lit
 from .lit_module import NodeDiffusionLitModule, export_node_diffusion_pt
 from .report import eval_node_diffusion, make_report_and_figures
-from ...ckpt import NodeDiffusionBundle, load_edge_model, load_surrogate
+from ...ckpt import load_edge_model, load_n_prior, load_surrogate
 from ...cycle_eval import run_cycle_eval
 from ...data import (
+    GraphStore,
     TessellationRowDataset,
     collate_first,
     discover_graph_ids,
@@ -29,11 +31,11 @@ from ...pl_callbacks import EmptyCacheCallback, JsonlMetricsCallback
 from ...pl_utils import lightning_device_from_arg
 from ...scaler import StandardScaler
 from ...transforms import apply_log_cols_torch
-from ...utils import ensure_dir, set_seed
+from ...utils import device_from_arg, ensure_dir, set_seed
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train node diffusion (Lightning): (RD, metrics) -> coords")
+    p = argparse.ArgumentParser(description="Train node diffusion (Lightning): (RD, logN, metrics) -> coords")
     p.add_argument("--data_csv", type=str, required=True)
     p.add_argument("--tess_root", type=str, default="data/Tessellation_Dataset")
     p.add_argument("--cond_cols", type=str, nargs="+", required=True)
@@ -50,7 +52,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=4)
 
     p.add_argument("--k_nn", type=int, default=12)
-    p.add_argument("--lambda_n", type=float, default=0.1)
 
     p.add_argument("--steps", type=int, default=100)
     p.add_argument("--beta_start", type=float, default=1e-4)
@@ -73,16 +74,39 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--cycle_deg_cap", type=int, default=12)
     p.add_argument("--cycle_min_n", type=int, default=64)
     p.add_argument("--cycle_max_n", type=int, default=5000)
+    p.add_argument("--cycle_n_mode", type=str, default="true", help="N selection: true|fixed|candidates|prior")
+    p.add_argument("--cycle_n_fixed", type=int, default=0)
+    p.add_argument("--cycle_n_candidates", type=int, nargs="*", default=[])
+    p.add_argument("--cycle_n_prior_ckpt", type=str, default="")
+    p.add_argument("--cycle_n_prior_samples", type=int, default=12)
     p.add_argument("--cycle_max_rows", type=int, default=0, help="0 = all test rows")
+    p.add_argument("--cycle_each_epoch", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--cycle_epoch_rows", type=int, default=100, help="-1 = all validation rows")
+    p.add_argument("--cycle_epoch_save_row_figs", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--cycle_epoch_save_graph_files", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--cycle_epoch_progress_every", type=int, default=1, help="0 disables cycle progress prints during training")
     p.add_argument("--cycle_save_row_figs", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--cycle_save_graph_files", action=argparse.BooleanOptionalAction, default=False)
     return p.parse_args()
 
 
-def _fit_cond_scaler(df: pd.DataFrame, rows: list[int], cond_cols: list[str], log_cols: set[str]) -> StandardScaler:
-    x = df.loc[rows, ["RD"] + cond_cols].to_numpy(dtype=np.float32)
+def _fit_cond_scaler(
+    df: pd.DataFrame,
+    rows: list[int],
+    *,
+    tess_root: str,
+    cond_cols: list[str],
+    log_cols: set[str],
+) -> StandardScaler:
+    store = GraphStore(tess_root=tess_root)
+    graph_ids = sorted({(int(r) // 5) + 1 for r in rows})
+    logn_by_gid = {gid: float(np.log(float(store.get(gid).n_nodes))) for gid in graph_ids}
+
+    base = df.loc[rows, ["RD"] + cond_cols].to_numpy(dtype=np.float32)
+    logn = np.array([logn_by_gid[(int(r) // 5) + 1] for r in rows], dtype=np.float32).reshape(-1, 1)
+    x = np.concatenate([base[:, 0:1], logn, base[:, 1:]], axis=1)
     x_t = torch.from_numpy(x)
-    x_t[:, 1:] = apply_log_cols_torch(x_t[:, 1:], cond_cols, log_cols)
+    x_t[:, 2:] = apply_log_cols_torch(x_t[:, 2:], cond_cols, log_cols)
     return StandardScaler.fit(x_t.numpy())
 
 
@@ -109,7 +133,7 @@ def main() -> None:
     val_rows = rows_for_graph_ids(len(df), val_g)
     test_rows = rows_for_graph_ids(len(df), test_g)
 
-    cond_scaler = _fit_cond_scaler(df, train_rows, cond_cols, log_cols)
+    cond_scaler = _fit_cond_scaler(df, train_rows, tess_root=args.tess_root, cond_cols=cond_cols, log_cols=log_cols)
 
     ds_train = TessellationRowDataset(
         data_csv=args.data_csv,
@@ -141,7 +165,7 @@ def main() -> None:
     dl_test = DataLoader(ds_test, batch_size=1, shuffle=False, collate_fn=collate_first, **dl_kwargs)
 
     den_cfg = NodeDenoiserConfig(
-        cond_dim=1 + len(cond_cols),
+        cond_dim=2 + len(cond_cols),
         d_h=int(args.d_h),
         n_layers=int(args.n_layers),
         n_rbf=int(args.n_rbf),
@@ -157,21 +181,59 @@ def main() -> None:
         cond_scaler_mean=cond_scaler.mean.tolist(),
         cond_scaler_std=cond_scaler.std.tolist(),
         k_nn=int(args.k_nn),
-        lambda_n=float(args.lambda_n),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
     )
 
+    cycle_enabled = bool(str(args.cycle_surrogate_ckpt) or str(args.cycle_edge_ckpt))
+    cycle_each_epoch = bool(args.cycle_each_epoch) and cycle_enabled
+    torch_device = device_from_arg(args.device)
+
+    if cycle_enabled and (not str(args.cycle_surrogate_ckpt) or not str(args.cycle_edge_ckpt)):
+        raise SystemExit("For cycle eval, provide both --cycle_surrogate_ckpt and --cycle_edge_ckpt.")
+
+    cycle_cb = None
+    if cycle_each_epoch:
+        surrogate = load_surrogate(str(args.cycle_surrogate_ckpt), device=torch_device)
+        edge_bundle = load_edge_model(str(args.cycle_edge_ckpt), device=torch_device)
+        n_prior = None
+        if str(args.cycle_n_mode) == "prior":
+            if not str(args.cycle_n_prior_ckpt):
+                raise SystemExit("For cycle_n_mode=prior, provide --cycle_n_prior_ckpt.")
+            n_prior = load_n_prior(str(args.cycle_n_prior_ckpt), device=torch_device)
+        cycle_cb = CycleEvalEveryEpochCallback(
+            df=df,
+            tess_root=args.tess_root,
+            row_indices=val_rows,
+            surrogate=surrogate,
+            edge_bundle=edge_bundle,
+            n_prior=n_prior,
+            device=torch_device,
+            out_dir_base=str(Path(args.out_dir) / "cycle_val"),
+            epoch_rows=int(args.cycle_epoch_rows),
+            k_best=int(args.cycle_k_best),
+            deg_cap=int(args.cycle_deg_cap),
+            min_n=int(args.cycle_min_n),
+            max_n=int(args.cycle_max_n),
+            n_mode=str(args.cycle_n_mode),
+            n_fixed=int(args.cycle_n_fixed),
+            n_candidates=[int(x) for x in list(args.cycle_n_candidates)],
+            n_prior_samples=int(args.cycle_n_prior_samples),
+            save_row_figs=bool(args.cycle_epoch_save_row_figs),
+            save_graph_files=bool(args.cycle_epoch_save_graph_files),
+            progress_every=int(args.cycle_epoch_progress_every),
+        )
+
     ckpt_cb = ModelCheckpoint(
         dirpath=args.out_dir,
         filename="best",
-        monitor="val/loss",
-        mode="min",
+        monitor="val/cycle_r_best" if cycle_each_epoch else "val/loss",
+        mode="max" if cycle_each_epoch else "min",
         save_top_k=1,
         save_last=True,
     )
     history_path = str(Path(args.out_dir) / "history.jsonl")
-    callbacks = [ckpt_cb, JsonlMetricsCallback(history_path), EmptyCacheCallback()]
+    callbacks = [c for c in [cycle_cb, ckpt_cb, JsonlMetricsCallback(history_path), EmptyCacheCallback()] if c is not None]
 
     t0 = time.time()
     trainer = pl.Trainer(
@@ -185,6 +247,7 @@ def main() -> None:
         limit_train_batches=args.limit_train_batches,
         limit_val_batches=args.limit_val_batches,
         limit_test_batches=args.limit_test_batches,
+        num_sanity_val_steps=0 if cycle_each_epoch else 2,
         enable_progress_bar=True,
         gradient_clip_val=1.0,
     )
@@ -213,47 +276,54 @@ def main() -> None:
     export_node_diffusion_pt(
         lit=best_lit,
         out_path=str(Path(args.out_dir) / "node_diffusion.pt"),
-        val_loss=float(ckpt_cb.best_model_score),
+        monitor={
+            "name": str(ckpt_cb.monitor),
+            "mode": str(ckpt_cb.mode),
+            "value": float(ckpt_cb.best_model_score),
+        },
     )
 
     # Report + figures
-    device = torch.device("cuda" if dev.accelerator == "gpu" else dev.accelerator)
+    device = torch_device
     best_lit = best_lit.to(device)
     test_eval = eval_node_diffusion(lit=best_lit, dl=dl_test, max_samples=int(args.report_max_samples))
     cycle_eval = None
-    if str(args.cycle_surrogate_ckpt) or str(args.cycle_edge_ckpt):
-        if not str(args.cycle_surrogate_ckpt) or not str(args.cycle_edge_ckpt):
-            raise SystemExit("For cycle eval, provide both --cycle_surrogate_ckpt and --cycle_edge_ckpt.")
+    if cycle_enabled:
         cycle_rows = test_rows if int(args.cycle_max_rows) == 0 else test_rows[: int(args.cycle_max_rows)]
-        surrogate = load_surrogate(str(args.cycle_surrogate_ckpt), device=device)
-        edge_bundle = load_edge_model(str(args.cycle_edge_ckpt), device=device)
-        cond_scaler = StandardScaler(
-            mean=best_lit.cond_scaler_mean.detach().cpu().numpy().astype(np.float32, copy=False),
-            std=best_lit.cond_scaler_std.detach().cpu().numpy().astype(np.float32, copy=False),
-        )
-        node_bundle = NodeDiffusionBundle(
-            denoiser=best_lit.denoiser,
-            n_pred=best_lit.n_pred,
-            schedule=best_lit.schedule,
-            cond_cols=list(best_lit.cond_cols),
-            log_cols=set(best_lit.log_cols),
-            cond_scaler=cond_scaler,
-            k_nn=int(best_lit.k_nn),
-        )
+        if cycle_cb is None:
+            surrogate = load_surrogate(str(args.cycle_surrogate_ckpt), device=device)
+            edge_bundle = load_edge_model(str(args.cycle_edge_ckpt), device=device)
+            n_prior = None
+            if str(args.cycle_n_mode) == "prior":
+                if not str(args.cycle_n_prior_ckpt):
+                    raise SystemExit("For cycle_n_mode=prior, provide --cycle_n_prior_ckpt.")
+                n_prior = load_n_prior(str(args.cycle_n_prior_ckpt), device=device)
+        else:
+            surrogate = cycle_cb.surrogate
+            edge_bundle = cycle_cb.edge_bundle
+            n_prior = cycle_cb.n_prior
+        node_bundle = node_bundle_from_lit(lit=best_lit)
         cycle_eval = run_cycle_eval(
             df=df,
             row_indices=[int(x) for x in cycle_rows],
+            tess_root=args.tess_root,
             surrogate=surrogate,
             node_bundle=node_bundle,
             edge_bundle=edge_bundle,
+            n_prior=n_prior,
             device=device,
             k_best=int(args.cycle_k_best),
             deg_cap=int(args.cycle_deg_cap),
             min_n=int(args.cycle_min_n),
             max_n=int(args.cycle_max_n),
+            n_mode=str(args.cycle_n_mode),
+            n_fixed=int(args.cycle_n_fixed),
+            n_candidates=[int(x) for x in list(args.cycle_n_candidates)],
+            n_prior_samples=int(args.cycle_n_prior_samples),
             out_dir=str(Path(args.out_dir) / "cycle"),
             save_row_figs=bool(args.cycle_save_row_figs),
             save_graph_files=bool(args.cycle_save_graph_files),
+            progress_prefix="cycle/test",
         )
     make_report_and_figures(run_dir=args.out_dir, history_path=history_path, test_eval=test_eval, cycle_eval=cycle_eval)
 
@@ -267,7 +337,6 @@ def main() -> None:
         "schedule_cfg": asdict(schedule_cfg),
         "train": {"epochs": int(args.epochs), "lr": float(args.lr), "weight_decay": float(args.weight_decay)},
         "k_nn": int(args.k_nn),
-        "lambda_n": float(args.lambda_n),
         "cycle_eval": {
             "enabled": bool(str(args.cycle_surrogate_ckpt) or str(args.cycle_edge_ckpt)),
             "surrogate_ckpt": str(args.cycle_surrogate_ckpt) if str(args.cycle_surrogate_ckpt) else None,
@@ -276,7 +345,17 @@ def main() -> None:
             "deg_cap": int(args.cycle_deg_cap),
             "min_n": int(args.cycle_min_n),
             "max_n": int(args.cycle_max_n),
+            "n_mode": str(args.cycle_n_mode),
+            "n_fixed": int(args.cycle_n_fixed),
+            "n_candidates": [int(x) for x in list(args.cycle_n_candidates)],
+            "n_prior_ckpt": str(args.cycle_n_prior_ckpt) if str(args.cycle_n_prior_ckpt) else None,
+            "n_prior_samples": int(args.cycle_n_prior_samples),
             "max_rows": int(args.cycle_max_rows),
+            "each_epoch": bool(cycle_each_epoch),
+            "epoch_rows": int(args.cycle_epoch_rows),
+            "epoch_save_row_figs": bool(args.cycle_epoch_save_row_figs),
+            "epoch_save_graph_files": bool(args.cycle_epoch_save_graph_files),
+            "epoch_progress_every": int(args.cycle_epoch_progress_every),
             "save_row_figs": bool(args.cycle_save_row_figs),
             "save_graph_files": bool(args.cycle_save_graph_files),
         },

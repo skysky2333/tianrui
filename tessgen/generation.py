@@ -12,23 +12,7 @@ from .graph_utils import (
     knn_candidate_pairs,
     pairs_to_edge_index,
 )
-from .node_diffusion import DiffusionSchedule, NodeDenoiser, NPredictor
-
-
-@torch.no_grad()
-def sample_node_count(
-    n_pred: NPredictor,
-    cond_z: torch.Tensor,
-    *,
-    min_n: int = 64,
-    max_n: int = 5000,
-) -> int:
-    mu, log_sigma = n_pred(cond_z)
-    sigma = torch.exp(log_sigma)
-    eps = torch.randn_like(mu)
-    logn = mu + sigma * eps
-    n = int(torch.round(torch.exp(logn)).clamp(min=float(min_n), max=float(max_n)).item())
-    return n
+from .node_diffusion import DiffusionSchedule, NodeDenoiser
 
 
 @torch.no_grad()
@@ -93,4 +77,3 @@ def sample_edges_from_coords(
         edges = ensure_connected_by_candidates(n_nodes, edges, cand, probs)
     edges = np.unique(edges, axis=0)
     return edges
-
