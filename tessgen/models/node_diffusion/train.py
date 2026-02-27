@@ -16,6 +16,8 @@ from torch.utils.data import DataLoader
 from .core import DiffusionConfig, NodeDenoiserConfig
 from .lit_module import NodeDiffusionLitModule, export_node_diffusion_pt
 from .report import eval_node_diffusion, make_report_and_figures
+from ...ckpt import NodeDiffusionBundle, load_edge_model, load_surrogate
+from ...cycle_eval import run_cycle_eval
 from ...data import (
     TessellationRowDataset,
     collate_first,
@@ -64,6 +66,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--limit_test_batches", type=float, default=1.0)
     p.add_argument("--log_every_n_steps", type=int, default=10)
     p.add_argument("--report_max_samples", type=int, default=0, help="0 = evaluate full test set in report")
+
+    p.add_argument("--cycle_surrogate_ckpt", type=str, default="", help="If set, run end-to-end cycle eval on test rows")
+    p.add_argument("--cycle_edge_ckpt", type=str, default="", help="Edge model ckpt used for cycle eval")
+    p.add_argument("--cycle_k_best", type=int, default=8)
+    p.add_argument("--cycle_deg_cap", type=int, default=12)
+    p.add_argument("--cycle_min_n", type=int, default=64)
+    p.add_argument("--cycle_max_n", type=int, default=5000)
+    p.add_argument("--cycle_max_rows", type=int, default=0, help="0 = all test rows")
+    p.add_argument("--cycle_save_row_figs", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--cycle_save_graph_files", action=argparse.BooleanOptionalAction, default=False)
     return p.parse_args()
 
 
@@ -208,7 +220,42 @@ def main() -> None:
     device = torch.device("cuda" if dev.accelerator == "gpu" else dev.accelerator)
     best_lit = best_lit.to(device)
     test_eval = eval_node_diffusion(lit=best_lit, dl=dl_test, max_samples=int(args.report_max_samples))
-    make_report_and_figures(run_dir=args.out_dir, history_path=history_path, test_eval=test_eval)
+    cycle_eval = None
+    if str(args.cycle_surrogate_ckpt) or str(args.cycle_edge_ckpt):
+        if not str(args.cycle_surrogate_ckpt) or not str(args.cycle_edge_ckpt):
+            raise SystemExit("For cycle eval, provide both --cycle_surrogate_ckpt and --cycle_edge_ckpt.")
+        cycle_rows = test_rows if int(args.cycle_max_rows) == 0 else test_rows[: int(args.cycle_max_rows)]
+        surrogate = load_surrogate(str(args.cycle_surrogate_ckpt), device=device)
+        edge_bundle = load_edge_model(str(args.cycle_edge_ckpt), device=device)
+        cond_scaler = StandardScaler(
+            mean=best_lit.cond_scaler_mean.detach().cpu().numpy().astype(np.float32, copy=False),
+            std=best_lit.cond_scaler_std.detach().cpu().numpy().astype(np.float32, copy=False),
+        )
+        node_bundle = NodeDiffusionBundle(
+            denoiser=best_lit.denoiser,
+            n_pred=best_lit.n_pred,
+            schedule=best_lit.schedule,
+            cond_cols=list(best_lit.cond_cols),
+            log_cols=set(best_lit.log_cols),
+            cond_scaler=cond_scaler,
+            k_nn=int(best_lit.k_nn),
+        )
+        cycle_eval = run_cycle_eval(
+            df=df,
+            row_indices=[int(x) for x in cycle_rows],
+            surrogate=surrogate,
+            node_bundle=node_bundle,
+            edge_bundle=edge_bundle,
+            device=device,
+            k_best=int(args.cycle_k_best),
+            deg_cap=int(args.cycle_deg_cap),
+            min_n=int(args.cycle_min_n),
+            max_n=int(args.cycle_max_n),
+            out_dir=str(Path(args.out_dir) / "cycle"),
+            save_row_figs=bool(args.cycle_save_row_figs),
+            save_graph_files=bool(args.cycle_save_graph_files),
+        )
+    make_report_and_figures(run_dir=args.out_dir, history_path=history_path, test_eval=test_eval, cycle_eval=cycle_eval)
 
     config = {
         "task": "node_diffusion",
@@ -221,6 +268,18 @@ def main() -> None:
         "train": {"epochs": int(args.epochs), "lr": float(args.lr), "weight_decay": float(args.weight_decay)},
         "k_nn": int(args.k_nn),
         "lambda_n": float(args.lambda_n),
+        "cycle_eval": {
+            "enabled": bool(str(args.cycle_surrogate_ckpt) or str(args.cycle_edge_ckpt)),
+            "surrogate_ckpt": str(args.cycle_surrogate_ckpt) if str(args.cycle_surrogate_ckpt) else None,
+            "edge_ckpt": str(args.cycle_edge_ckpt) if str(args.cycle_edge_ckpt) else None,
+            "k_best": int(args.cycle_k_best),
+            "deg_cap": int(args.cycle_deg_cap),
+            "min_n": int(args.cycle_min_n),
+            "max_n": int(args.cycle_max_n),
+            "max_rows": int(args.cycle_max_rows),
+            "save_row_figs": bool(args.cycle_save_row_figs),
+            "save_graph_files": bool(args.cycle_save_graph_files),
+        },
         "splits": {"val_frac": float(args.val_frac), "test_frac": float(args.test_frac)},
         "device": {"accelerator": dev.accelerator, "devices": dev.devices},
         "elapsed_sec": float(time.time() - t0),

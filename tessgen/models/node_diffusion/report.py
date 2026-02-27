@@ -85,7 +85,7 @@ def eval_node_diffusion(
     }
 
 
-def make_report_and_figures(*, run_dir: str, history_path: str, test_eval: dict) -> None:
+def make_report_and_figures(*, run_dir: str, history_path: str, test_eval: dict, cycle_eval: dict | None = None) -> None:
     run = Path(run_dir)
     figs = run / "figures"
     figs.mkdir(parents=True, exist_ok=True)
@@ -155,4 +155,6 @@ def make_report_and_figures(*, run_dir: str, history_path: str, test_eval: dict)
         )
 
     report = {"task": "node_diffusion", "test": test_eval, "figures_dir": str(figs)}
+    if cycle_eval is not None:
+        report["test"]["cycle"] = cycle_eval
     write_json(str(run / "report.json"), report)

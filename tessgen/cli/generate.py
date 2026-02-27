@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +14,7 @@ from ..constants import COORD_MIN, COORD_RANGE
 from ..data import undirected_to_directed_edge_index
 from ..generation import ddpm_sample_coords, sample_edges_from_coords, sample_node_count
 from ..transforms import apply_log_cols_torch, invert_log_cols_torch
-from ..utils import Batch, device_from_arg, ensure_dir, set_seed
+from ..utils import Batch, device_from_arg, ensure_dir, format_progress_bar, set_seed
 from ..viz import save_graph_figure
 
 
@@ -100,6 +102,11 @@ def main() -> None:
     y_target_z = surrogate.scaler.transform_torch(y_target_t)
 
     results = []
+    total = int(len(rd_values) * int(k_per_rd))
+    if total <= 0:
+        raise RuntimeError("Internal error: total samples must be > 0")
+    t0 = time.time()
+    done = 0
     for rd in rd_values:
         # Standardized condition vector for node diffusion: [RD] + cond_cols
         rd_t = torch.tensor([[float(rd)]], device=device, dtype=torch.float32)
@@ -158,6 +165,10 @@ def main() -> None:
                     "pred": {c: float(pred[i]) for i, c in enumerate(surrogate.target_cols)},
                 }
             )
+            done += 1
+            msg = format_progress_bar(done=done, total=total, start_time=t0, prefix="generate")
+            end = "\n" if done == total else "\r"
+            print(msg, end=end, file=sys.stderr, flush=True)
 
     results.sort(key=lambda d: d["err"])
     keep = results[: int(args.top_m)]

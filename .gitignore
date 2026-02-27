@@ -2,3 +2,7 @@
 /data
 /out
 /runs
+tessgen/__pycache__/
+tessgen/cli/__pycache__/
+tessgen/models/node_diffusion/__pycache__/
+tessgen/models/__pycache__/

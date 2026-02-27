@@ -110,6 +110,37 @@ def save_scatter_plot(
     plt.close()
 
 
+def save_scatter_plot_both(
+    *,
+    out_png: str,
+    out_svg: str,
+    x: list[float],
+    y: list[float],
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    dpi: int = 160,
+) -> None:
+    mpl_setup()
+    import matplotlib.pyplot as plt
+
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_svg).parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(4.8, 4.8))
+    plt.scatter(x, y, s=6, alpha=0.35)
+    mn = min(min(x), min(y)) if x and y else 0.0
+    mx = max(max(x), max(y)) if x and y else 1.0
+    plt.plot([mn, mx], [mn, mx], color="black", linewidth=1, alpha=0.6)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=int(dpi))
+    plt.savefig(out_svg)
+    plt.close()
+
+
 def save_histogram(
     *,
     out_path: str,
@@ -130,4 +161,31 @@ def save_histogram(
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_path, dpi=160)
+    plt.close()
+
+
+def save_histogram_both(
+    *,
+    out_png: str,
+    out_svg: str,
+    values: list[float],
+    title: str,
+    xlabel: str,
+    bins: int = 60,
+    dpi: int = 160,
+) -> None:
+    mpl_setup()
+    import matplotlib.pyplot as plt
+
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_svg).parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(6, 4))
+    plt.hist(values, bins=int(bins), alpha=0.85)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel("count")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=int(dpi))
+    plt.savefig(out_svg)
     plt.close()

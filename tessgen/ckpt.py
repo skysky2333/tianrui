@@ -66,7 +66,7 @@ def load_node_diffusion(ckpt_path: str, *, device: torch.device) -> NodeDiffusio
     denoiser = NodeDenoiser(den_cfg).to(device)
     denoiser.load_state_dict(ckpt["denoiser_state"])
     denoiser.eval()
-    n_pred = NPredictor(cond_dim=den_cfg.cond_dim, d_h=den_cfg.d_h).to(device)
+    n_pred = NPredictor(cond_dim=den_cfg.cond_dim, d_h=den_cfg.d_h, dropout=float(den_cfg.dropout)).to(device)
     n_pred.load_state_dict(ckpt["n_pred_state"])
     n_pred.eval()
     cond_cols = list(ckpt["cond_cols"])

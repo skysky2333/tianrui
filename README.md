@@ -88,11 +88,29 @@ conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
   --device cpu
 ```
 
+Optional: run an end-to-end cycle benchmark (metrics → graph → surrogate → metrics) on the diffusion **test split** at the
+end of training:
+
+```bash
+conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
+  --data_csv data/Data_2.csv \
+  --cond_cols RS \
+  --epochs 8 \
+  --out_dir runs/node_diffusion \
+  --device cpu \
+  --cycle_surrogate_ckpt runs/surrogate/surrogate.pt \
+  --cycle_edge_ckpt runs/edge/edge_model.pt \
+  --cycle_k_best 8
+```
+
 Outputs in `runs/node_diffusion/`:
 - `node_diffusion.pt` (inference artifact)
 - `best.ckpt` / `last.ckpt` (Lightning checkpoints)
 - `config.json`, `history.jsonl`, `report.json`
 - `figures/` (loss curves + node-count prediction plots; includes `loss_symlog.png` and `diff_mse_logy.png`)
+
+If cycle eval is enabled, additional outputs are written in `runs/node_diffusion/cycle/` and the diffusion `report.json`
+includes `test.cycle.metrics.*` (Pearson/Spearman, MAE/RMSE, R²) for both single-sample and best-of-k.
 
 5) Generate K candidate graphs for a target `(RD, RS)`:
 
@@ -104,7 +122,8 @@ conda run -n tianrui python -m tessgen.cli.generate \
   --surrogate_ckpt runs/surrogate/surrogate.pt \
   --node_ckpt runs/node_diffusion/node_diffusion.pt \
   --edge_ckpt runs/edge/edge_model.pt \
-  --out_dir out/generated
+  --out_dir out/generated \
+  --device cpu
 ```
 
 Notes:
@@ -121,12 +140,37 @@ the best sample by surrogate score. When searching, `--k` is interpreted as **sa
 conda run -n tianrui python -m tessgen.cli.generate \
   --cond RS=0.01 \
   --rd_candidates 0.01 0.05 0.1 0.15 0.2 \
-  --k 2 \
+  --k 4 \
   --surrogate_ckpt runs/surrogate/surrogate.pt \
   --node_ckpt runs/node_diffusion/node_diffusion.pt \
   --edge_ckpt runs/edge/edge_model.pt \
-  --out_dir out/generated_infer_rd
+  --out_dir out/generated_infer_rd \
+  --device cpu
+
 ```
+
+7) End-to-end benchmark on the test split (metrics → graph → surrogate → metrics):
+
+This evaluates the full pipeline by taking test-set metrics (e.g. `RS`) + true `RD`, generating a graph with the
+node diffusion + edge model, then predicting metrics with the surrogate and benchmarking correlation/error vs the
+original test metrics.
+
+```bash
+conda run -n tianrui python -m tessgen.cli.benchmark_cycle \
+  --data_csv data/Data_2.csv \
+  --surrogate_ckpt runs/surrogate/surrogate.pt \
+  --node_ckpt runs/node_diffusion/node_diffusion.pt \
+  --edge_ckpt runs/edge/edge_model.pt \
+  --out_dir out/bench_cycle \
+  --device cpu
+```
+
+Outputs in `out/bench_cycle/`:
+- `report.json` (Pearson/Spearman, MAE/RMSE, R² for both single-sample and best-of-k)
+- `rows.jsonl` (per-row predictions/errors)
+- `figures/` (summary scatter + error hist, PNG+SVG)
+- `graphs_single/`, `graphs_best/` (per-row graph visualizations, PNG+SVG)
+
 
 ## Hyperparameter tuning (Optuna)
 
