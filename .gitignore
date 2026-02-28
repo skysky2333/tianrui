@@ -9,3 +9,5 @@ tessgen/models/__pycache__/
 tessgen/models/n_prior/__pycache__/
 tessgen/models/surrogate/__pycache__/
 tessgen/models/edge/__pycache__/
+
+agent.md
