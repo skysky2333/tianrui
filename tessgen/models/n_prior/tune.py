@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -20,7 +21,8 @@ from ...pl_utils import lightning_device_from_arg
 from ...reporting import save_line_plot, write_json
 from ...scaler import StandardScaler
 from ...transforms import apply_log_cols_torch
-from ...utils import ensure_dir, set_seed
+from ...outdirs import finalize_out_dir, make_timestamped_run_dir
+from ...utils import set_seed
 
 
 def _parse_args() -> argparse.Namespace:
@@ -35,9 +37,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--num_workers", type=int, default=4)
 
-    p.add_argument("--max_epochs", type=int, default=3)
+    p.add_argument("--sigma_min", type=float, nargs="+", default=[0.3, 1.2], help="Sigma_min spec: 1=fixed, 2=log-uniform range, >2=categorical")
+
+    p.add_argument("--max_epochs", type=int, default=1)
     p.add_argument("--limit_train_batches", type=float, default=0.1)
-    p.add_argument("--limit_val_batches", type=float, default=0.2)
+    p.add_argument("--limit_val_batches", type=float, default=1.0)
 
     p.add_argument("--n_trials", type=int, default=20)
     p.add_argument("--timeout_sec", type=int, default=0)
@@ -54,7 +58,7 @@ def _fit_x_scaler(df: pd.DataFrame, rows: list[int], cond_cols: list[str], log_c
 
 def main() -> None:
     args = _parse_args()
-    ensure_dir(args.out_dir)
+    base_dir, run_dir, run_name = make_timestamped_run_dir(args.out_dir)
     set_seed(args.seed)
     pl.seed_everything(args.seed, workers=True)
 
@@ -77,12 +81,24 @@ def main() -> None:
     dl_train = DataLoader(ds_train, batch_size=int(args.batch_size), shuffle=True, **dl_kwargs)
     dl_val = DataLoader(ds_val, batch_size=int(args.batch_size), shuffle=False, **dl_kwargs)
 
+    sigma_min_spec = [float(x) for x in list(args.sigma_min)]
+    if not sigma_min_spec:
+        raise SystemExit("--sigma_min must provide at least one value")
+
     def objective(trial: optuna.Trial) -> float:
+        if len(sigma_min_spec) == 1:
+            sigma_min = float(sigma_min_spec[0])
+        elif len(sigma_min_spec) == 2:
+            s0, s1 = float(sigma_min_spec[0]), float(sigma_min_spec[1])
+            sigma_min = float(trial.suggest_float("sigma_min", min(s0, s1), max(s0, s1), log=True))
+        else:
+            sigma_min = float(trial.suggest_categorical("sigma_min", sigma_min_spec))
+
         cfg = NPriorConfig(
             d_h=trial.suggest_categorical("d_h", [64, 96, 128, 160, 192]),
             n_layers=trial.suggest_int("n_layers", 2, 5),
             dropout=trial.suggest_float("dropout", 0.0, 0.2),
-            sigma_min=0.7,
+            sigma_min=sigma_min,
         )
         lr = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
         wd = trial.suggest_float("weight_decay", 1e-4, 5e-2, log=True)
@@ -105,6 +121,7 @@ def main() -> None:
             enable_progress_bar=False,
             limit_train_batches=float(args.limit_train_batches),
             limit_val_batches=float(args.limit_val_batches),
+            num_sanity_val_steps=0,
         )
         trainer.fit(lit, train_dataloaders=dl_train, val_dataloaders=dl_val)
         val = trainer.callback_metrics["val/nll"]
@@ -121,13 +138,13 @@ def main() -> None:
     study.optimize(objective, n_trials=int(args.n_trials), timeout=None if args.timeout_sec == 0 else int(args.timeout_sec))
 
     df_trials = study.trials_dataframe()
-    df_trials.to_csv(str(Path(args.out_dir) / "trials.csv"), index=False)
-    write_json(str(Path(args.out_dir) / "best.json"), {"best_value": float(study.best_value), "best_params": study.best_params})
+    df_trials.to_csv(str(run_dir / "trials.csv"), index=False)
+    write_json(str(run_dir / "best.json"), {"best_value": float(study.best_value), "best_params": study.best_params})
 
     values = [t.value for t in study.trials if t.value is not None]
     xs = list(range(1, len(values) + 1))
     save_line_plot(
-        out_path=str(Path(args.out_dir) / "optuna_history.png"),
+        out_path=str(run_dir / "optuna_history.png"),
         x=xs,
         ys={"val/nll": [float(v) for v in values]},
         title="Optuna tuning history (n prior)",
@@ -143,6 +160,7 @@ def main() -> None:
         "log_cols": sorted(log_cols),
         "val_frac": float(args.val_frac),
         "device": {"accelerator": dev.accelerator, "devices": dev.devices},
+        "search_space": {"sigma_min": sigma_min_spec},
         "n_trials": int(args.n_trials),
         "timeout_sec": int(args.timeout_sec),
         "max_epochs": int(args.max_epochs),
@@ -150,12 +168,25 @@ def main() -> None:
         "limit_val_batches": float(args.limit_val_batches),
         "best_value": float(study.best_value),
         "best_params": study.best_params,
+        "base_out_dir": str(base_dir),
+        "run_dir": str(run_dir),
+        "run_name": str(run_name),
     }
-    write_json(str(Path(args.out_dir) / "config.json"), cfg_out)
+    write_json(str(run_dir / "config.json"), cfg_out)
 
-    print(json.dumps({"best_value": float(study.best_value), "best_params": study.best_params}), flush=True)
+    finalize_out_dir(base_dir=base_dir, run_dir=run_dir, run_name=run_name, argv=sys.argv)
+    print(
+        json.dumps(
+            {
+                "best_value": float(study.best_value),
+                "best_params": study.best_params,
+                "run_dir": str(run_dir),
+                "base_out_dir": str(base_dir),
+            }
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
     main()
-

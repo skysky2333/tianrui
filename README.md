@@ -38,9 +38,18 @@ conda run -n tianrui python -m tessgen.cli.visualize_graph \
   --out_svg out/graph_1.svg
 ```
 
-`tessgen.cli.generate` also writes `--out_dir/figures/graph_gen_<i>.png` and `graph_gen_<i>.svg` for each saved sample.
+`tessgen.cli.generate` writes `graph_gen_<i>.png` and `graph_gen_<i>.svg` under `--out_dir/<timestamp>/figures/` for each saved sample.
 
 ## Quickstart
+
+## Output directories
+
+All commands in this repo that accept `--out_dir` treat it as a **base directory**:
+
+- Full outputs for each run are written under `--out_dir/<timestamp>/`
+- The most recent run is recorded in `--out_dir/latest_run.json`
+- Key top-level files from the latest run (e.g. `*.pt`, `best.ckpt`, `config.json`, `trials.csv`) are copied into `--out_dir/`
+  so stable paths like `runs/surrogate/surrogate.pt` keep working.
 
 1) Sanity-check parsing:
 
@@ -60,11 +69,13 @@ conda run -n tianrui python -m tessgen.cli.train_surrogate \
   --device cpu
 ```
 
-Outputs in `runs/surrogate/`:
+Outputs in `runs/surrogate/<timestamp>/` (full run):
 - `surrogate.pt` (inference artifact used by `tessgen.cli.generate`)
 - `best.ckpt` / `last.ckpt` (Lightning checkpoints)
 - `config.json`, `history.jsonl`, `report.json`
 - `figures/` (loss curves + regression plots; includes `loss_mse_z_logy.png`)
+
+Latest top-level artifacts are also copied into `runs/surrogate/` (see `runs/surrogate/latest_run.json`).
 
 3) Train an edge model (coords → edges):
 
@@ -75,12 +86,14 @@ conda run -n tianrui python -m tessgen.cli.train_edge \
   --device cpu
 ```
 
-Outputs in `runs/edge/`:
+Outputs in `runs/edge/<timestamp>/` (full run):
 - `edge_model.pt` (inference artifact)
 - `best.ckpt` / `last.ckpt` (Lightning checkpoints)
 - `config.json`, `history.jsonl`, `report.json`
 - `figures/` (loss curve, PR/ROC curves, probability histograms; includes `loss_bce_logy.png`)
 - `preview_val/epoch_###/` (optional per-epoch qualitative previews; disable with `--no-preview_each_epoch`)
+
+Latest top-level artifacts are also copied into `runs/edge/` (see `runs/edge/latest_run.json`).
 
 4) Train an N prior (RD + metrics → log(N)):
 
@@ -93,11 +106,13 @@ conda run -n tianrui python -m tessgen.cli.train_n_prior \
   --device cpu
 ```
 
-Outputs in `runs/n_prior/`:
+Outputs in `runs/n_prior/<timestamp>/` (full run):
 - `n_prior.pt` (inference artifact used by `tessgen.cli.generate` when `--n_nodes` is omitted)
 - `best.ckpt` / `last.ckpt` (Lightning checkpoints)
 - `config.json`, `history.jsonl`, `report.json`
 - `figures/` (NLL curves + log(N) scatter/hist)
+
+Latest top-level artifacts are also copied into `runs/n_prior/` (see `runs/n_prior/latest_run.json`).
 
 5) Train a node diffusion model (RD + logN + metrics → coords):
 
@@ -131,18 +146,20 @@ conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
 
 To disable the per-epoch validation cycle eval (and monitor `val/loss` instead), add `--no-cycle_each_epoch`.
 
-Outputs in `runs/node_diffusion/`:
+Outputs in `runs/node_diffusion/<timestamp>/` (full run):
 - `node_diffusion.pt` (inference artifact)
 - `best.ckpt` / `last.ckpt` (Lightning checkpoints)
 - `config.json`, `history.jsonl`, `report.json`
 - `figures/` (loss curves; includes `loss_symlog.png` and `diff_mse_logy.png`)
 
-If cycle eval is enabled, additional outputs are written in `runs/node_diffusion/cycle/` and the diffusion `report.json`
+Latest top-level artifacts are also copied into `runs/node_diffusion/` (see `runs/node_diffusion/latest_run.json`).
+
+If cycle eval is enabled, additional outputs are written in `runs/node_diffusion/<timestamp>/cycle/` and the diffusion `report.json`
 includes `test.cycle.metrics.*` (Pearson/Spearman, MAE/RMSE, R²) for both single-sample and best-of-k.
 The diffusion run also includes `figures/cycle_pearson_r.(png|svg)`.
 
 If per-epoch cycle eval is enabled (default when cycle ckpts are provided), outputs are written under:
-- `runs/node_diffusion/cycle_val/epoch_###/`
+- `runs/node_diffusion/<timestamp>/cycle_val/epoch_###/`
 and `figures/cycle_r_over_epoch.png` is generated from `history.jsonl`.
 
 6) Generate candidate graphs for a target `(RD, RS)`:
@@ -206,7 +223,7 @@ conda run -n tianrui python -m tessgen.cli.benchmark_cycle \
   --device cpu
 ```
 
-Outputs in `out/bench_cycle/`:
+Outputs in `out/bench_cycle/<timestamp>/` (full run):
 - `report.json` (Pearson/Spearman, MAE/RMSE, R² for both single-sample and best-of-k)
 - `rows.jsonl` (per-row predictions/errors)
 - `figures/` (summary scatter + error hist, PNG+SVG)
@@ -216,6 +233,12 @@ Outputs in `out/bench_cycle/`:
 ## Hyperparameter tuning (Optuna)
 
 Each model has an optional Optuna tuner that searches hyperparameters against the validation split.
+Tuners default to `--max_epochs 1` per trial for speed; increase it for more reliable ranking.
+
+Notes on default search spaces:
+- `tune_edge` tunes `k` and `neg_ratio` (pass a single value to fix either)
+- `tune_node_diffusion` tunes `k_nn`, `steps`, `beta_start`, and `beta_end` (pass a single value to fix any of them)
+- `tune_n_prior` tunes `sigma_min` (pass a single value to fix it)
 
 Surrogate:
 
@@ -252,6 +275,7 @@ conda run -n tianrui python -m tessgen.cli.tune_n_prior \
 ```
 
 Each tuning run writes `trials.csv`, `best.json`, `optuna_history.png`, and `config.json`.
+Each tuning run writes its full outputs under `--out_dir/<timestamp>/` and copies key files into `--out_dir/` for convenience.
 
 ## Code layout
 

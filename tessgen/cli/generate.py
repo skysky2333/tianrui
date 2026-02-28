@@ -16,7 +16,8 @@ from ..data import undirected_to_directed_edge_index
 from ..generation import ddpm_sample_coords, sample_edges_from_coords
 from ..n_select import clamp_and_unique, sample_n_candidates_from_prior
 from ..transforms import apply_log_cols_torch, invert_log_cols_torch
-from ..utils import Batch, device_from_arg, ensure_dir, set_seed
+from ..outdirs import finalize_out_dir, make_timestamped_run_dir
+from ..utils import Batch, device_from_arg, set_seed
 from ..viz import save_graph_figure
 
 
@@ -68,7 +69,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    ensure_dir(args.out_dir)
+    base_dir, run_dir, run_name = make_timestamped_run_dir(args.out_dir)
     set_seed(args.seed)
     device = device_from_arg(args.device)
 
@@ -245,11 +246,11 @@ def main() -> None:
     for i, r in enumerate(keep, start=1):
         coords01 = r["coords01"]
         coords = coords01 * COORD_RANGE + COORD_MIN
-        node_path = Path(args.out_dir) / f"Node_gen_{i}.txt"
-        conn_path = Path(args.out_dir) / f"Connection_gen_{i}.txt"
-        meta_path = Path(args.out_dir) / f"meta_{i}.json"
-        fig_png = Path(args.out_dir) / "figures" / f"graph_gen_{i}.png"
-        fig_svg = Path(args.out_dir) / "figures" / f"graph_gen_{i}.svg"
+        node_path = run_dir / f"Node_gen_{i}.txt"
+        conn_path = run_dir / f"Connection_gen_{i}.txt"
+        meta_path = run_dir / f"meta_{i}.json"
+        fig_png = run_dir / "figures" / f"graph_gen_{i}.png"
+        fig_svg = run_dir / "figures" / f"graph_gen_{i}.svg"
 
         with open(node_path, "w") as f:
             for nid, (x, y) in enumerate(coords, start=1):
@@ -289,11 +290,13 @@ def main() -> None:
         )
 
     best_rd = keep[0]["rd"] if keep else None
+    finalize_out_dir(base_dir=base_dir, run_dir=run_dir, run_name=run_name, argv=sys.argv)
     print(
         json.dumps(
             {
                 "saved": len(keep),
-                "out_dir": args.out_dir,
+                "base_out_dir": str(base_dir),
+                "run_dir": str(run_dir),
                 "best_err_mse_z": keep[0]["err"] if keep else None,
                 "best_rd": float(best_rd) if best_rd is not None else None,
                 "rd_search": args.rd is None,

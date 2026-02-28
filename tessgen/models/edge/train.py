@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -19,7 +20,8 @@ from .report import eval_edge_model, make_report_and_figures
 from ...data import collate_first, discover_graph_ids, train_val_test_split_graph_ids
 from ...pl_callbacks import EmptyCacheCallback, JsonlMetricsCallback
 from ...pl_utils import lightning_device_from_arg
-from ...utils import device_from_arg, ensure_dir, set_seed
+from ...outdirs import finalize_out_dir, make_timestamped_run_dir
+from ...utils import device_from_arg, set_seed
 
 
 def _parse_args() -> argparse.Namespace:
@@ -60,7 +62,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    ensure_dir(args.out_dir)
+    base_dir, run_dir, run_name = make_timestamped_run_dir(args.out_dir)
     set_seed(args.seed)
     pl.seed_everything(args.seed, workers=True)
 
@@ -88,20 +90,20 @@ def main() -> None:
     lit = EdgeLitModule(cfg=asdict(cfg), k=int(args.k), neg_ratio=float(args.neg_ratio), lr=float(args.lr), weight_decay=float(args.weight_decay))
 
     ckpt_cb = ModelCheckpoint(
-        dirpath=args.out_dir,
+        dirpath=str(run_dir),
         filename="best",
         monitor="val/bce",
         mode="min",
         save_top_k=1,
         save_last=True,
     )
-    history_path = str(Path(args.out_dir) / "history.jsonl")
+    history_path = str(run_dir / "history.jsonl")
     preview_cb = None
     if bool(args.preview_each_epoch):
         preview_cb = EdgePreviewEveryEpochCallback(
             tess_root=str(args.tess_root),
             graph_ids=val_g,
-            out_dir_base=str(Path(args.out_dir) / "preview_val"),
+            out_dir_base=str(run_dir / "preview_val"),
             epoch_graphs=int(args.preview_epoch_graphs),
             edge_thr=float(args.preview_edge_thr),
             deg_cap=int(args.preview_deg_cap),
@@ -114,7 +116,7 @@ def main() -> None:
         max_epochs=int(args.epochs),
         accelerator=dev.accelerator,
         devices=dev.devices,
-        default_root_dir=args.out_dir,
+        default_root_dir=str(run_dir),
         logger=False,
         callbacks=callbacks,
         log_every_n_steps=int(args.log_every_n_steps),
@@ -147,7 +149,7 @@ def main() -> None:
         raise RuntimeError("No best_model_score found on ModelCheckpoint callback.")
     export_edge_pt(
         lit=best_lit,
-        out_path=str(Path(args.out_dir) / "edge_model.pt"),
+        out_path=str(run_dir / "edge_model.pt"),
         val_bce=float(ckpt_cb.best_model_score),
     )
 
@@ -159,7 +161,7 @@ def main() -> None:
         thr=float(args.thr),
         max_pairs=int(args.max_pairs_report),
     )
-    make_report_and_figures(run_dir=args.out_dir, history_path=history_path, test_eval=test_eval)
+    make_report_and_figures(run_dir=str(run_dir), history_path=history_path, test_eval=test_eval)
 
     config = {
         "task": "edge_model",
@@ -180,11 +182,16 @@ def main() -> None:
         "device": {"accelerator": dev.accelerator, "devices": dev.devices},
         "elapsed_sec": float(time.time() - t0),
         "best_ckpt": best_path,
+        "base_out_dir": str(base_dir),
+        "run_dir": str(run_dir),
+        "run_name": str(run_name),
     }
-    with open(str(Path(args.out_dir) / "config.json"), "w") as f:
+    with open(str(run_dir / "config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
-    print(f"saved: {args.out_dir}")
+    finalize_out_dir(base_dir=base_dir, run_dir=run_dir, run_name=run_name, argv=sys.argv)
+    print(f"saved_run_dir: {run_dir}")
+    print(f"saved_base_dir: {base_dir} (latest files copied here)")
 
 
 if __name__ == "__main__":

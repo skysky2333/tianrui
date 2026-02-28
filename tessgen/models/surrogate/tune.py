@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -24,7 +25,8 @@ from ...data import (
 from ...pl_utils import lightning_device_from_arg
 from ...scaler import StandardScaler
 from ...transforms import apply_log_cols_torch
-from ...utils import ensure_dir, set_seed
+from ...outdirs import finalize_out_dir, make_timestamped_run_dir
+from ...utils import set_seed
 from ...reporting import save_line_plot, write_json
 
 
@@ -40,7 +42,7 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--max_epochs", type=int, default=5)
+    p.add_argument("--max_epochs", type=int, default=1)
     p.add_argument("--limit_train_batches", type=float, default=0.2)
     p.add_argument("--limit_val_batches", type=float, default=1.0)
 
@@ -59,7 +61,7 @@ def _fit_target_scaler(df: pd.DataFrame, rows: list[int], target_cols: list[str]
 
 def main() -> None:
     args = _parse_args()
-    ensure_dir(args.out_dir)
+    base_dir, run_dir, run_name = make_timestamped_run_dir(args.out_dir)
     set_seed(args.seed)
     pl.seed_everything(args.seed, workers=True)
 
@@ -116,6 +118,7 @@ def main() -> None:
             enable_progress_bar=False,
             limit_train_batches=float(args.limit_train_batches),
             limit_val_batches=float(args.limit_val_batches),
+            num_sanity_val_steps=0,
         )
         trainer.fit(lit, train_dataloaders=dl_train, val_dataloaders=dl_val)
         val = trainer.callback_metrics["val/mse_z"]
@@ -133,14 +136,14 @@ def main() -> None:
 
     # Save results
     df_trials = study.trials_dataframe()
-    df_trials.to_csv(str(Path(args.out_dir) / "trials.csv"), index=False)
-    write_json(str(Path(args.out_dir) / "best.json"), {"best_value": float(study.best_value), "best_params": study.best_params})
+    df_trials.to_csv(str(run_dir / "trials.csv"), index=False)
+    write_json(str(run_dir / "best.json"), {"best_value": float(study.best_value), "best_params": study.best_params})
 
     # Simple plot: trial value over time
     values = [t.value for t in study.trials if t.value is not None]
     xs = list(range(1, len(values) + 1))
     save_line_plot(
-        out_path=str(Path(args.out_dir) / "optuna_history.png"),
+        out_path=str(run_dir / "optuna_history.png"),
         x=xs,
         ys={"val/mse_z": [float(v) for v in values]},
         title="Optuna tuning history (surrogate)",
@@ -163,10 +166,24 @@ def main() -> None:
         "limit_val_batches": float(args.limit_val_batches),
         "best_value": float(study.best_value),
         "best_params": study.best_params,
+        "base_out_dir": str(base_dir),
+        "run_dir": str(run_dir),
+        "run_name": str(run_name),
     }
-    write_json(str(Path(args.out_dir) / "config.json"), cfg_out)
+    write_json(str(run_dir / "config.json"), cfg_out)
 
-    print(json.dumps({"best_value": float(study.best_value), "best_params": study.best_params}), flush=True)
+    finalize_out_dir(base_dir=base_dir, run_dir=run_dir, run_name=run_name, argv=sys.argv)
+    print(
+        json.dumps(
+            {
+                "best_value": float(study.best_value),
+                "best_params": study.best_params,
+                "run_dir": str(run_dir),
+                "base_out_dir": str(base_dir),
+            }
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

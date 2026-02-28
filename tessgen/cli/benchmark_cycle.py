@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -9,8 +10,9 @@ import pandas as pd
 from ..cycle_eval import run_cycle_eval
 from ..ckpt import load_edge_model, load_n_prior, load_node_diffusion, load_surrogate
 from ..data import discover_graph_ids, rows_for_graph_ids, train_val_test_split_graph_ids
+from ..outdirs import finalize_out_dir, make_timestamped_run_dir
 from ..reporting import write_json
-from ..utils import device_from_arg, ensure_dir, set_seed
+from ..utils import device_from_arg, set_seed
 
 
 def _parse_args() -> argparse.Namespace:
@@ -46,7 +48,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    ensure_dir(args.out_dir)
+    base_dir, run_dir, run_name = make_timestamped_run_dir(args.out_dir)
     set_seed(int(args.seed))
 
     if not (0.0 <= float(args.edge_thr) <= 1.0):
@@ -94,7 +96,7 @@ def main() -> None:
         n_fixed=int(args.n_fixed),
         n_candidates=[int(x) for x in list(args.n_candidates)],
         n_prior_samples=int(args.n_prior_samples),
-        out_dir=args.out_dir,
+        out_dir=str(run_dir),
         save_row_figs=bool(args.save_row_figs),
         save_graph_files=bool(args.save_graph_files),
         progress_prefix="cycle/test",
@@ -108,9 +110,13 @@ def main() -> None:
         "ckpts": {"surrogate": args.surrogate_ckpt, "node_diffusion": args.node_ckpt, "edge": args.edge_ckpt},
         "device": str(device),
         "cycle": cycle,
+        "base_out_dir": str(base_dir),
+        "run_dir": str(run_dir),
+        "run_name": str(run_name),
     }
-    write_json(str(Path(args.out_dir) / "report.json"), report)
-    print(json.dumps({"saved": args.out_dir, "test_rows": int(len(test_rows)), "elapsed_sec": float(cycle["elapsed_sec"])}))
+    write_json(str(run_dir / "report.json"), report)
+    finalize_out_dir(base_dir=base_dir, run_dir=run_dir, run_name=run_name, argv=sys.argv)
+    print(json.dumps({"saved_run_dir": str(run_dir), "saved_base_dir": str(base_dir), "test_rows": int(len(test_rows)), "elapsed_sec": float(cycle["elapsed_sec"])}))
 
 
 if __name__ == "__main__":
