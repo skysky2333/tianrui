@@ -69,6 +69,7 @@ class NPriorBundle:
     cond_cols: list[str]
     log_cols: set[str]
     scaler: StandardScaler
+    use_rd: bool
 
 
 def load_n_prior(ckpt_path: str, *, device: torch.device) -> NPriorBundle:
@@ -77,10 +78,12 @@ def load_n_prior(ckpt_path: str, *, device: torch.device) -> NPriorBundle:
     cond_cols = list(ckpt["cond_cols"])
     log_cols = set(ckpt["log_cols"])
     scaler = StandardScaler(mean=np.array(ckpt["scaler_mean"], dtype=np.float32), std=np.array(ckpt["scaler_std"], dtype=np.float32))
-    model = NPriorModel(x_dim=1 + len(cond_cols), cfg=cfg).to(device)
+    use_rd = bool(ckpt.get("use_rd", True))
+    x_dim = (1 + len(cond_cols)) if use_rd else len(cond_cols)
+    model = NPriorModel(x_dim=x_dim, cfg=cfg).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
-    return NPriorBundle(model=model, cond_cols=cond_cols, log_cols=log_cols, scaler=scaler)
+    return NPriorBundle(model=model, cond_cols=cond_cols, log_cols=log_cols, scaler=scaler, use_rd=use_rd)
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,7 @@ class NodeDiffusionBundle:
     cond_cols: list[str]
     log_cols: set[str]
     cond_scaler: StandardScaler
+    use_rd: bool
     k_nn: int
 
 
@@ -103,6 +107,7 @@ def load_node_diffusion(ckpt_path: str, *, device: torch.device) -> NodeDiffusio
     denoiser.eval()
     cond_cols = list(ckpt["cond_cols"])
     log_cols = set(ckpt["log_cols"])
+    use_rd = bool(ckpt.get("use_rd", True))
     cond_scaler = StandardScaler(
         mean=np.array(ckpt["cond_scaler_mean"], dtype=np.float32),
         std=np.array(ckpt["cond_scaler_std"], dtype=np.float32),
@@ -114,5 +119,6 @@ def load_node_diffusion(ckpt_path: str, *, device: torch.device) -> NodeDiffusio
         cond_cols=cond_cols,
         log_cols=log_cols,
         cond_scaler=cond_scaler,
+        use_rd=use_rd,
         k_nn=k_nn,
     )

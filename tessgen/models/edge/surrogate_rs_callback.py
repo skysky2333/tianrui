@@ -12,8 +12,8 @@ from ..edge_3.lit_module import Edge3LitModule
 from ...ckpt import EdgeBundle, SurrogateBundle
 from ...data import GraphStore, undirected_to_directed_edge_index
 from ...generation import sample_edges_from_coords
-from ...metrics import pearson_r
-from ...reporting import write_json
+from ...metrics import mae, pearson_r, rmse
+from ...reporting import save_histogram_both, save_scatter_plot_both, write_json, write_jsonl
 from ...transforms import invert_log_cols_torch
 from ...utils import Batch
 
@@ -70,6 +70,36 @@ class SurrogateRSEveryEpochCallback(pl.Callback):
 
         self.store = GraphStore(self.tess_root)
 
+    @staticmethod
+    def _compute_rs_metrics(*, y_true: list[float], y_pred: list[float]) -> dict[str, float | int]:
+        yt = np.asarray(y_true, dtype=np.float64)
+        yp = np.asarray(y_pred, dtype=np.float64)
+        if yt.size == 0 or yp.size == 0:
+            return {
+                "n": 0,
+                "pearson_r": float("nan"),
+                "mae": float("nan"),
+                "rmse": float("nan"),
+                "bias_mean": float("nan"),
+                "bias_median": float("nan"),
+                "frac_over": float("nan"),
+            }
+        diff = yp - yt
+        return {
+            "n": int(yt.size),
+            "pearson_r": float(pearson_r(yt, yp)),
+            "mae": float(mae(yt, yp)),
+            "rmse": float(rmse(yt, yp)),
+            "bias_mean": float(np.mean(diff)),
+            "bias_median": float(np.median(diff)),
+            "frac_over": float(np.mean(yp > yt)),
+        }
+
+    @staticmethod
+    def _log10_safe(x: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        return np.log10(np.clip(x, float(eps), None))
+
     @torch.no_grad()
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:  # type: ignore[override]
         if trainer.sanity_checking:
@@ -103,8 +133,10 @@ class SurrogateRSEveryEpochCallback(pl.Callback):
         pl_module.eval()
 
         y_true: list[float] = []
-        y_pred: list[float] = []
+        y_pred_sampled: list[float] = []
+        y_pred_true_edges: list[float] = []
         edges_cache: dict[int, np.ndarray] = {}
+        row_records: list[dict] = []
 
         for row_idx in rows:
             if int(row_idx) < 0 or int(row_idx) >= int(len(self.df)):
@@ -117,6 +149,8 @@ class SurrogateRSEveryEpochCallback(pl.Callback):
 
             g = self.store.get(int(graph_id))
             coords01_cpu = g.coords01.to(dtype=torch.float32)
+            n_nodes = int(coords01_cpu.shape[0])
+            n_edges_true = int(g.edges_undirected.shape[0])
 
             if int(graph_id) not in edges_cache:
                 edges_uv = sample_edges_from_coords(
@@ -133,7 +167,6 @@ class SurrogateRSEveryEpochCallback(pl.Callback):
 
             coords01 = coords01_cpu.to(device=self.device)
             edge_index = undirected_to_directed_edge_index(edges_uv).to(self.device)
-            n_nodes = int(coords01.shape[0])
             batch = Batch(
                 x=coords01,
                 edge_index=edge_index,
@@ -150,11 +183,104 @@ class SurrogateRSEveryEpochCallback(pl.Callback):
             rs_pred = float(pred_raw[0, int(self.rs_idx)].detach().cpu().item())
 
             y_true.append(float(rs_true))
-            y_pred.append(float(rs_pred))
+            y_pred_sampled.append(float(rs_pred))
 
-        r_val = pearson_r(np.array(y_true, dtype=np.float64), np.array(y_pred, dtype=np.float64))
+            # Baseline: surrogate on the true graph edges (no edge sampling)
+            batch_true = Batch(
+                x=coords01,
+                edge_index=g.edge_index.to(device=self.device),
+                batch=torch.zeros((n_nodes,), device=self.device, dtype=torch.long),
+                rd=torch.tensor([[float(rd)]], device=self.device, dtype=torch.float32),
+                y=torch.zeros((1, int(len(self.surrogate.target_cols))), device=self.device, dtype=torch.float32),
+                n_nodes=torch.tensor([int(n_nodes)], device=self.device, dtype=torch.long),
+                n_edges=torch.tensor([int(n_edges_true)], device=self.device, dtype=torch.long),
+            )
+            pred_z_true = self.surrogate.model(batch_true)
+            pred_t_true = self.surrogate.scaler.inverse_transform_torch(pred_z_true)
+            pred_raw_true = invert_log_cols_torch(pred_t_true, self.surrogate.target_cols, self.surrogate.log_cols)
+            rs_pred_true = float(pred_raw_true[0, int(self.rs_idx)].detach().cpu().item())
+            y_pred_true_edges.append(float(rs_pred_true))
+
+            row_records.append(
+                {
+                    "row_idx": int(row_idx),
+                    "graph_id": int(graph_id),
+                    "rd": float(rd),
+                    "rs_col": str(self.rs_col),
+                    "rs_true": float(rs_true),
+                    "rs_pred_sampled": float(rs_pred),
+                    "rs_pred_true_edges": float(rs_pred_true),
+                    "n_nodes": int(n_nodes),
+                    "n_edges_true": int(n_edges_true),
+                    "n_edges_sampled": int(edges_uv.shape[0]),
+                }
+            )
+
+        # Metrics + artifacts
+        metrics_sampled = self._compute_rs_metrics(y_true=y_true, y_pred=y_pred_sampled)
+        metrics_true = self._compute_rs_metrics(y_true=y_true, y_pred=y_pred_true_edges)
 
         out_dir = Path(self.out_dir_base) / f"epoch_{epoch:03d}"
+        rows_path = out_dir / "rows.jsonl"
+        figs_dir = out_dir / "figures"
+        write_jsonl(str(rows_path), row_records)
+
+        yt = np.asarray(y_true, dtype=np.float64)
+        yp_s = np.asarray(y_pred_sampled, dtype=np.float64)
+        yp_t = np.asarray(y_pred_true_edges, dtype=np.float64)
+        save_scatter_plot_both(
+            out_png=str(figs_dir / "rs_scatter_sampled.png"),
+            out_svg=str(figs_dir / "rs_scatter_sampled.svg"),
+            x=yt.tolist(),
+            y=yp_s.tolist(),
+            title=f"{self.rs_col}: true vs predicted (edge-sampled)",
+            xlabel=f"true {self.rs_col}",
+            ylabel=f"pred {self.rs_col}",
+        )
+        save_scatter_plot_both(
+            out_png=str(figs_dir / "rs_scatter_true_edges.png"),
+            out_svg=str(figs_dir / "rs_scatter_true_edges.svg"),
+            x=yt.tolist(),
+            y=yp_t.tolist(),
+            title=f"{self.rs_col}: true vs predicted (true edges baseline)",
+            xlabel=f"true {self.rs_col}",
+            ylabel=f"pred {self.rs_col}",
+        )
+        save_scatter_plot_both(
+            out_png=str(figs_dir / "rs_scatter_sampled_log10.png"),
+            out_svg=str(figs_dir / "rs_scatter_sampled_log10.svg"),
+            x=self._log10_safe(yt).tolist(),
+            y=self._log10_safe(yp_s).tolist(),
+            title=f"log10({self.rs_col}): true vs predicted (edge-sampled)",
+            xlabel=f"log10(true {self.rs_col})",
+            ylabel=f"log10(pred {self.rs_col})",
+        )
+        save_scatter_plot_both(
+            out_png=str(figs_dir / "rs_scatter_true_edges_log10.png"),
+            out_svg=str(figs_dir / "rs_scatter_true_edges_log10.svg"),
+            x=self._log10_safe(yt).tolist(),
+            y=self._log10_safe(yp_t).tolist(),
+            title=f"log10({self.rs_col}): true vs predicted (true edges baseline)",
+            xlabel=f"log10(true {self.rs_col})",
+            ylabel=f"log10(pred {self.rs_col})",
+        )
+        save_histogram_both(
+            out_png=str(figs_dir / "rs_error_hist_sampled.png"),
+            out_svg=str(figs_dir / "rs_error_hist_sampled.svg"),
+            values=(yp_s - yt).tolist(),
+            title=f"{self.rs_col} error (pred-true) (edge-sampled)",
+            xlabel=f"{self.rs_col}_pred - {self.rs_col}_true",
+            bins=80,
+        )
+        save_histogram_both(
+            out_png=str(figs_dir / "rs_error_hist_true_edges.png"),
+            out_svg=str(figs_dir / "rs_error_hist_true_edges.svg"),
+            values=(yp_t - yt).tolist(),
+            title=f"{self.rs_col} error (pred-true) (true edges baseline)",
+            xlabel=f"{self.rs_col}_pred - {self.rs_col}_true",
+            bins=80,
+        )
+
         write_json(
             str(out_dir / "surrogate_rs_summary.json"),
             {
@@ -162,7 +288,11 @@ class SurrogateRSEveryEpochCallback(pl.Callback):
                 "epoch": int(epoch),
                 "rs_col": str(self.rs_col),
                 "n_rows": int(len(rows)),
-                "pearson_r": float(r_val),
+                "pearson_r": float(metrics_sampled["pearson_r"]),
+                "metrics": {
+                    "sampled": metrics_sampled,
+                    "true_edges": metrics_true,
+                },
                 "edge": {
                     "variant": str(edge_bundle.variant),
                     "cand_mode": str(edge_bundle.cand_mode),
@@ -171,8 +301,20 @@ class SurrogateRSEveryEpochCallback(pl.Callback):
                     "edge_thr": float(self.edge_thr),
                     "deg_cap": int(self.deg_cap),
                 },
+                "artifacts": {
+                    "rows_jsonl": str(rows_path),
+                    "figures_dir": str(figs_dir),
+                },
             },
         )
 
-        pl_module.log("val/surrogate_rs_r", float(r_val), on_step=False, on_epoch=True, prog_bar=True, logger=False, batch_size=1)
+        pl_module.log(
+            "val/surrogate_rs_r",
+            float(metrics_sampled["pearson_r"]),
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=False,
+            batch_size=1,
+        )
         pl_module.log("val/surrogate_rs_n", float(len(rows)), on_step=False, on_epoch=True, prog_bar=False, logger=False, batch_size=1)

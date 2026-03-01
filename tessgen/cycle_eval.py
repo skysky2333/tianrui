@@ -17,6 +17,7 @@ from .generation import ddpm_sample_coords, sample_edges_from_coords
 from .metrics import mae, pearson_r, r2_score, rmse, spearman_r
 from .n_select import clamp_and_unique, sample_n_candidates_from_prior
 from .reporting import save_histogram_both, save_scatter_plot_both
+from .rd_solve import solve_rd_for_target
 from .transforms import apply_log_cols_torch, invert_log_cols_torch
 from .utils import Batch, ensure_dir
 from .viz import save_graph_figure
@@ -25,7 +26,7 @@ from .viz import save_graph_figure
 def _compute_metrics(*, y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     y_true = np.asarray(y_true, dtype=np.float64)
     y_pred = np.asarray(y_pred, dtype=np.float64)
-    return {
+    out = {
         "n": int(y_true.size),
         "pearson_r": pearson_r(y_true, y_pred),
         "spearman_r": spearman_r(y_true, y_pred),
@@ -33,6 +34,31 @@ def _compute_metrics(*, y_true: np.ndarray, y_pred: np.ndarray) -> dict:
         "rmse": rmse(y_true, y_pred),
         "r2": r2_score(y_true, y_pred),
     }
+
+    if y_true.size:
+        out["frac_over"] = float(np.mean(y_pred > y_true))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = y_pred / y_true
+        ratio = ratio[np.isfinite(ratio)]
+        out["median_ratio"] = float(np.median(ratio)) if ratio.size else float("nan")
+
+        pos = (y_true > 0.0) & (y_pred > 0.0)
+        out["n_log"] = int(np.sum(pos))
+        if int(out["n_log"]) > 0:
+            log_err = np.log10(y_pred[pos]) - np.log10(y_true[pos])
+            out["mean_log10_err"] = float(np.mean(log_err))
+            out["rmse_log10"] = float(np.sqrt(float(np.mean(log_err**2))))
+        else:
+            out["mean_log10_err"] = float("nan")
+            out["rmse_log10"] = float("nan")
+    else:
+        out["frac_over"] = float("nan")
+        out["median_ratio"] = float("nan")
+        out["n_log"] = 0
+        out["mean_log10_err"] = float("nan")
+        out["rmse_log10"] = float("nan")
+
+    return out
 
 
 @torch.no_grad()
@@ -46,6 +72,11 @@ def run_cycle_eval(
     edge_bundle: EdgeBundle,
     n_prior: NPriorBundle | None = None,
     device: torch.device,
+    rd_mode: str = "fixed",  # fixed|solve
+    rd_min: float = 0.01,
+    rd_max: float = 0.2,
+    rd_grid_steps: int = 21,
+    rd_refine_iters: int = 24,
     k_best: int,
     deg_cap: int,
     min_n: int,
@@ -79,11 +110,28 @@ def run_cycle_eval(
     if k_best <= 0:
         raise ValueError("k_best must be >= 1")
 
-    need_cols = set(["RD"]) | set(node_bundle.cond_cols) | set(surrogate.target_cols)
+    rd_mode_s = str(rd_mode)
+    if rd_mode_s not in {"fixed", "solve"}:
+        raise ValueError(f"Unsupported rd_mode={rd_mode_s!r} (expected 'fixed' or 'solve')")
+    rd_min_f = float(rd_min)
+    rd_max_f = float(rd_max)
+    if rd_mode_s == "solve":
+        if not (rd_min_f > 0.0 and rd_max_f > rd_min_f):
+            raise ValueError(f"Expected 0 < rd_min < rd_max, got rd_min={rd_min_f} rd_max={rd_max_f}")
+        if int(rd_grid_steps) < 3:
+            raise ValueError("rd_grid_steps must be >= 3")
+        if int(rd_refine_iters) < 0:
+            raise ValueError("rd_refine_iters must be >= 0")
+
+    need_cols = set(node_bundle.cond_cols) | set(surrogate.target_cols)
+    need_rd_col = bool(node_bundle.use_rd) or (rd_mode_s == "fixed")
     if str(n_mode) == "prior":
         if n_prior is None:
             raise ValueError("n_prior must be provided when n_mode='prior'")
         need_cols |= set(n_prior.cond_cols)
+        need_rd_col = need_rd_col or bool(n_prior.use_rd)
+    if need_rd_col:
+        need_cols.add("RD")
     missing = [c for c in sorted(need_cols) if c not in df.columns]
     if missing:
         raise ValueError(f"CSV missing required columns: {missing}")
@@ -122,7 +170,12 @@ def run_cycle_eval(
                 row_idx = int(row_idx)
                 r = df.iloc[row_idx]
                 graph_id = int((row_idx // 5) + 1)
-                rd = float(r["RD"])
+                rd_label = float(r["RD"]) if "RD" in df.columns else float("nan")
+                rd = float(rd_label)
+                if bool(node_bundle.use_rd) and (not np.isfinite(rd)):
+                    raise ValueError(f"Row idx={row_idx} has non-finite RD={rd!r}, but node diffusion requires RD.")
+                rd_t_fixed = torch.tensor([[float(rd)]], device=device, dtype=torch.float32)
+                rd_t_diff = rd_t_fixed if bool(node_bundle.use_rd) else None
 
                 # True graph baseline (surrogate on ground-truth graph)
                 pbar.set_postfix_str(f"row={row_pos}/{len(row_indices)} idx={row_idx} step=true_graph", refresh=True)
@@ -136,27 +189,47 @@ def run_cycle_eval(
                 y_target_t = apply_log_cols_torch(y_target, surrogate.target_cols, surrogate.log_cols)
                 y_target_z = surrogate.scaler.transform_torch(y_target_t)
 
-                rd_t = torch.tensor([[rd]], device=device, dtype=torch.float32)
-                batch_true = Batch(
-                    x=g_true.coords01.to(device),
-                    edge_index=g_true.edge_index.to(device),
-                    batch=torch.zeros((n_nodes_true,), device=device, dtype=torch.long),
-                    rd=rd_t,
-                    y=y_target_z,
-                    n_nodes=torch.tensor([n_nodes_true], device=device, dtype=torch.long),
-                    n_edges=torch.tensor([n_edges_true], device=device, dtype=torch.long),
-                )
-                pred_z_true = surrogate.model(batch_true)
-                err_true = torch.mean((pred_z_true - y_target_z) ** 2).item()
-                pred_t_true = surrogate.scaler.inverse_transform_torch(pred_z_true)
-                pred_vec_true = (
-                    invert_log_cols_torch(pred_t_true, surrogate.target_cols, surrogate.log_cols)
-                    .squeeze(0)
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .astype(np.float32, copy=False)
-                )
+                rd_true_solved = None
+                rd_true_hit_bound = None
+                if rd_mode_s == "fixed":
+                    batch_true = Batch(
+                        x=g_true.coords01.to(device),
+                        edge_index=g_true.edge_index.to(device),
+                        batch=torch.zeros((n_nodes_true,), device=device, dtype=torch.long),
+                        rd=rd_t_fixed,
+                        y=y_target_z,
+                        n_nodes=torch.tensor([n_nodes_true], device=device, dtype=torch.long),
+                        n_edges=torch.tensor([n_edges_true], device=device, dtype=torch.long),
+                    )
+                    pred_z_true = surrogate.model(batch_true)
+                    err_true = torch.mean((pred_z_true - y_target_z) ** 2).item()
+                    pred_t_true = surrogate.scaler.inverse_transform_torch(pred_z_true)
+                    pred_vec_true = (
+                        invert_log_cols_torch(pred_t_true, surrogate.target_cols, surrogate.log_cols)
+                        .squeeze(0)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32, copy=False)
+                    )
+                else:
+                    solved = solve_rd_for_target(
+                        surrogate=surrogate,
+                        x=g_true.coords01.to(device),
+                        edge_index=g_true.edge_index.to(device),
+                        n_nodes=int(n_nodes_true),
+                        n_edges=int(n_edges_true),
+                        y_target_z=y_target_z,
+                        rd_min=rd_min_f,
+                        rd_max=rd_max_f,
+                        grid_steps=int(rd_grid_steps),
+                        refine_iters=int(rd_refine_iters),
+                        device=device,
+                    )
+                    err_true = float(solved["err_best"])
+                    pred_vec_true = np.asarray(solved["pred_vec_best"], dtype=np.float32)
+                    rd_true_solved = float(solved["rd_best"])
+                    rd_true_hit_bound = bool(solved["hit_bound"])
                 t_base = float(time.perf_counter() - t_base0)
                 pbar.set_postfix_str(
                     f"row={row_pos}/{len(row_indices)} idx={row_idx} step=true_graph base={t_base:.3g}s err={err_true:.3g}",
@@ -205,7 +278,12 @@ def run_cycle_eval(
                 for j in range(k_best):
                     n_nodes = int(n_values[j % len(n_values)])
                     logn_t = torch.tensor([[float(np.log(float(n_nodes)))]], device=device, dtype=torch.float32)
-                    cond_full = torch.cat([rd_t, logn_t, cond_vals], dim=-1)
+                    if bool(node_bundle.use_rd):
+                        if rd_t_diff is None:
+                            raise RuntimeError("Internal error: rd_t_diff is None but node_bundle.use_rd=True")
+                        cond_full = torch.cat([rd_t_diff, logn_t, cond_vals], dim=-1)
+                    else:
+                        cond_full = torch.cat([logn_t, cond_vals], dim=-1)
                     cond_z = node_bundle.cond_scaler.transform_torch(cond_full).squeeze(0)
 
                     pbar.set_postfix_str(
@@ -239,36 +317,60 @@ def run_cycle_eval(
                     t_edge = float(time.perf_counter() - t_edge0)
 
                     edge_index = undirected_to_directed_edge_index(edges_uv).to(device)
-                    batch = Batch(
-                        x=coords01,
-                        edge_index=edge_index,
-                        batch=torch.zeros((n_nodes,), device=device, dtype=torch.long),
-                        rd=rd_t,
-                        y=y_target_z,
-                        n_nodes=torch.tensor([n_nodes], device=device, dtype=torch.long),
-                        n_edges=torch.tensor([int(edges_uv.shape[0])], device=device, dtype=torch.long),
-                    )
+                    rd_solved = None
+                    rd_hit_bound = None
+                    if rd_mode_s == "fixed":
+                        batch = Batch(
+                            x=coords01,
+                            edge_index=edge_index,
+                            batch=torch.zeros((n_nodes,), device=device, dtype=torch.long),
+                            rd=rd_t_fixed,
+                            y=y_target_z,
+                            n_nodes=torch.tensor([n_nodes], device=device, dtype=torch.long),
+                            n_edges=torch.tensor([int(edges_uv.shape[0])], device=device, dtype=torch.long),
+                        )
 
                     pbar.set_postfix_str(
                         f"row={row_pos}/{len(row_indices)} idx={row_idx} step=surrogate j={j+1}/{k_best} rd={rd:.4g} N={n_nodes} ddpm={t_ddpm:.3g}s edge={t_edge:.3g}s",
                         refresh=True,
                     )
                     t_sur0 = time.perf_counter()
-                    pred_z = surrogate.model(batch)
-                    err = torch.mean((pred_z - y_target_z) ** 2).item()
-                    pred_t = surrogate.scaler.inverse_transform_torch(pred_z)
-                    pred_vec = (
-                        invert_log_cols_torch(pred_t, surrogate.target_cols, surrogate.log_cols)
-                        .squeeze(0)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .astype(np.float32, copy=False)
-                    )
+                    if rd_mode_s == "fixed":
+                        pred_z = surrogate.model(batch)
+                        err = torch.mean((pred_z - y_target_z) ** 2).item()
+                        pred_t = surrogate.scaler.inverse_transform_torch(pred_z)
+                        pred_vec = (
+                            invert_log_cols_torch(pred_t, surrogate.target_cols, surrogate.log_cols)
+                            .squeeze(0)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            .astype(np.float32, copy=False)
+                        )
+                    else:
+                        solved = solve_rd_for_target(
+                            surrogate=surrogate,
+                            x=coords01,
+                            edge_index=edge_index,
+                            n_nodes=int(n_nodes),
+                            n_edges=int(edges_uv.shape[0]),
+                            y_target_z=y_target_z,
+                            rd_min=rd_min_f,
+                            rd_max=rd_max_f,
+                            grid_steps=int(rd_grid_steps),
+                            refine_iters=int(rd_refine_iters),
+                            device=device,
+                        )
+                        err = float(solved["err_best"])
+                        pred_vec = np.asarray(solved["pred_vec_best"], dtype=np.float32)
+                        rd_solved = float(solved["rd_best"])
+                        rd_hit_bound = bool(solved["hit_bound"])
                     t_sur = float(time.perf_counter() - t_sur0)
 
                     cand = {
                         "err_mse_z": float(err),
+                        "rd_solved": float(rd_solved) if rd_solved is not None else None,
+                        "rd_hit_bound": bool(rd_hit_bound) if rd_hit_bound is not None else None,
                         "n_nodes": int(n_nodes),
                         "n_edges": int(edges_uv.shape[0]),
                         "coords01": coords01.detach().cpu().numpy(),
@@ -314,18 +416,26 @@ def run_cycle_eval(
                     "row_idx": int(row_idx),
                     "graph_id": int(graph_id),
                     "rd": float(rd),
+                    "rd_mode": str(rd_mode_s),
+                    "rd_cond": float(rd) if bool(node_bundle.use_rd) else None,
                     "targets": {c: float(y_true_vec[i]) for i, c in enumerate(surrogate.target_cols)},
                     "rs_col": rs_col,
                     "true_graph": {
                         "err_mse_z": float(err_true),
                         "n_nodes": int(n_nodes_true),
                         "n_edges": int(n_edges_true),
+                        "rd_used": float(rd) if rd_mode_s == "fixed" else None,
+                        "rd_solved": float(rd_true_solved) if rd_true_solved is not None else None,
+                        "rd_hit_bound": bool(rd_true_hit_bound) if rd_true_hit_bound is not None else None,
                         "pred": true_pred,
                     },
                     "single": {
                         "err_mse_z": float(single["err_mse_z"]),
                         "n_nodes": int(single["n_nodes"]),
                         "n_edges": int(single["n_edges"]),
+                        "rd_used": float(rd) if rd_mode_s == "fixed" else None,
+                        "rd_solved": single.get("rd_solved"),
+                        "rd_hit_bound": single.get("rd_hit_bound"),
                         "pred": single_pred,
                     },
                     "best": {
@@ -333,6 +443,9 @@ def run_cycle_eval(
                         "err_mse_z": float(best["err_mse_z"]),
                         "n_nodes": int(best["n_nodes"]),
                         "n_edges": int(best["n_edges"]),
+                        "rd_used": float(rd) if rd_mode_s == "fixed" else None,
+                        "rd_solved": best.get("rd_solved"),
+                        "rd_hit_bound": best.get("rd_hit_bound"),
                         "pred": best_pred,
                     },
                 }
@@ -421,9 +534,11 @@ def run_cycle_eval(
             "best": _compute_metrics(y_true=rs_true_all, y_pred=rs_best_all),
             "per_rd": {},
         }
-        for rd_val in sorted(set(rd_all)):
-            mask = rd_np == float(rd_val)
-            metrics["per_rd"][str(rd_val)] = {
+        rd_vals = np.unique(rd_np[np.isfinite(rd_np)])
+        for rd_val in rd_vals.tolist():
+            rd_f = float(rd_val)
+            mask = rd_np == rd_f
+            metrics["per_rd"][str(rd_f)] = {
                 "n": int(mask.sum()),
                 "true_graph": _compute_metrics(y_true=rs_true_all[mask], y_pred=rs_truegraph_all[mask]),
                 "single": _compute_metrics(y_true=rs_true_all[mask], y_pred=rs_single_all[mask]),

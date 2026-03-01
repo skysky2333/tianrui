@@ -37,11 +37,12 @@ from ...utils import device_from_arg, set_seed
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train node diffusion (Lightning): (RD, logN, metrics) -> coords")
+    p = argparse.ArgumentParser(description="Train node diffusion (Lightning): (logN, metrics [+ optional RD]) -> coords")
     p.add_argument("--data_csv", type=str, required=True)
     p.add_argument("--tess_root", type=str, default="data/Tessellation_Dataset")
     p.add_argument("--cond_cols", type=str, nargs="+", required=True)
     p.add_argument("--log_cols", type=str, nargs="*", default=["RS"])
+    p.add_argument("--use_rd", action=argparse.BooleanOptionalAction, default=True, help="Include RD as an input feature")
 
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -72,6 +73,11 @@ def _parse_args() -> argparse.Namespace:
 
     p.add_argument("--cycle_surrogate_ckpt", type=str, default="", help="If set, run end-to-end cycle eval on test rows")
     p.add_argument("--cycle_edge_ckpt", type=str, default="", help="Edge model ckpt used for cycle eval")
+    p.add_argument("--cycle_rd_mode", type=str, default="fixed", help="How to handle RD during scoring: fixed|solve")
+    p.add_argument("--cycle_rd_min", type=float, default=0.01, help="RD solve lower bound (used when cycle_rd_mode=solve)")
+    p.add_argument("--cycle_rd_max", type=float, default=0.2, help="RD solve upper bound (used when cycle_rd_mode=solve)")
+    p.add_argument("--cycle_rd_grid_steps", type=int, default=21, help="Coarse grid steps for RD solve (used when cycle_rd_mode=solve)")
+    p.add_argument("--cycle_rd_refine_iters", type=int, default=24, help="Golden-section refinement iterations (used when cycle_rd_mode=solve)")
     p.add_argument("--cycle_k_best", type=int, default=8)
     p.add_argument("--cycle_deg_cap", type=int, default=12)
     p.add_argument("--cycle_edge_thr", type=float, default=0.5, help="Edge probability threshold used during cycle eval edge sampling")
@@ -100,16 +106,30 @@ def _fit_cond_scaler(
     tess_root: str,
     cond_cols: list[str],
     log_cols: set[str],
+    use_rd: bool,
 ) -> StandardScaler:
     store = GraphStore(tess_root=tess_root)
     graph_ids = sorted({(int(r) // 5) + 1 for r in rows})
     logn_by_gid = {gid: float(np.log(float(store.get(gid).n_nodes))) for gid in graph_ids}
 
-    base = df.loc[rows, ["RD"] + cond_cols].to_numpy(dtype=np.float32)
+    use_rd = bool(use_rd)
+    if use_rd:
+        base = df.loc[rows, ["RD"] + cond_cols].to_numpy(dtype=np.float32)
+        rd = base[:, 0:1]
+        cond = base[:, 1:]
+    else:
+        base = df.loc[rows, cond_cols].to_numpy(dtype=np.float32)
+        rd = None
+        cond = base
     logn = np.array([logn_by_gid[(int(r) // 5) + 1] for r in rows], dtype=np.float32).reshape(-1, 1)
-    x = np.concatenate([base[:, 0:1], logn, base[:, 1:]], axis=1)
+    if rd is None:
+        x = np.concatenate([logn, cond], axis=1)
+        cond_start = 1
+    else:
+        x = np.concatenate([rd, logn, cond], axis=1)
+        cond_start = 2
     x_t = torch.from_numpy(x)
-    x_t[:, 2:] = apply_log_cols_torch(x_t[:, 2:], cond_cols, log_cols)
+    x_t[:, cond_start:] = apply_log_cols_torch(x_t[:, cond_start:], cond_cols, log_cols)
     return StandardScaler.fit(x_t.numpy())
 
 
@@ -124,6 +144,7 @@ def main() -> None:
 
     cond_cols = list(args.cond_cols)
     log_cols = set(args.log_cols or [])
+    use_rd = bool(args.use_rd)
 
     dev = lightning_device_from_arg(args.device)
     num_workers = int(args.num_workers)
@@ -139,7 +160,14 @@ def main() -> None:
     val_rows = rows_for_graph_ids(len(df), val_g)
     test_rows = rows_for_graph_ids(len(df), test_g)
 
-    cond_scaler = _fit_cond_scaler(df, train_rows, tess_root=args.tess_root, cond_cols=cond_cols, log_cols=log_cols)
+    cond_scaler = _fit_cond_scaler(
+        df,
+        train_rows,
+        tess_root=args.tess_root,
+        cond_cols=cond_cols,
+        log_cols=log_cols,
+        use_rd=use_rd,
+    )
 
     ds_train = TessellationRowDataset(
         data_csv=args.data_csv,
@@ -171,7 +199,7 @@ def main() -> None:
     dl_test = DataLoader(ds_test, batch_size=1, shuffle=False, collate_fn=collate_first, **dl_kwargs)
 
     den_cfg = NodeDenoiserConfig(
-        cond_dim=2 + len(cond_cols),
+        cond_dim=(2 + len(cond_cols)) if use_rd else (1 + len(cond_cols)),
         d_h=int(args.d_h),
         n_layers=int(args.n_layers),
         n_rbf=int(args.n_rbf),
@@ -186,6 +214,7 @@ def main() -> None:
         log_cols=sorted(log_cols),
         cond_scaler_mean=cond_scaler.mean.tolist(),
         cond_scaler_std=cond_scaler.std.tolist(),
+        use_rd=use_rd,
         k_nn=int(args.k_nn),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
@@ -217,6 +246,11 @@ def main() -> None:
             device=torch_device,
             out_dir_base=str(run_dir / "cycle_val"),
             epoch_rows=int(args.cycle_epoch_rows),
+            rd_mode=str(args.cycle_rd_mode),
+            rd_min=float(args.cycle_rd_min),
+            rd_max=float(args.cycle_rd_max),
+            rd_grid_steps=int(args.cycle_rd_grid_steps),
+            rd_refine_iters=int(args.cycle_rd_refine_iters),
             k_best=int(args.cycle_k_best),
             deg_cap=int(args.cycle_deg_cap),
             min_n=int(args.cycle_min_n),
@@ -319,6 +353,11 @@ def main() -> None:
             edge_bundle=edge_bundle,
             n_prior=n_prior,
             device=device,
+            rd_mode=str(args.cycle_rd_mode),
+            rd_min=float(args.cycle_rd_min),
+            rd_max=float(args.cycle_rd_max),
+            rd_grid_steps=int(args.cycle_rd_grid_steps),
+            rd_refine_iters=int(args.cycle_rd_refine_iters),
             k_best=int(args.cycle_k_best),
             deg_cap=int(args.cycle_deg_cap),
             min_n=int(args.cycle_min_n),
@@ -341,6 +380,7 @@ def main() -> None:
         "tess_root": args.tess_root,
         "cond_cols": cond_cols,
         "log_cols": sorted(log_cols),
+        "use_rd": bool(use_rd),
         "denoiser_cfg": asdict(den_cfg),
         "schedule_cfg": asdict(schedule_cfg),
         "train": {"epochs": int(args.epochs), "lr": float(args.lr), "weight_decay": float(args.weight_decay)},
@@ -349,6 +389,11 @@ def main() -> None:
             "enabled": bool(str(args.cycle_surrogate_ckpt) or str(args.cycle_edge_ckpt)),
             "surrogate_ckpt": str(args.cycle_surrogate_ckpt) if str(args.cycle_surrogate_ckpt) else None,
             "edge_ckpt": str(args.cycle_edge_ckpt) if str(args.cycle_edge_ckpt) else None,
+            "rd_mode": str(args.cycle_rd_mode),
+            "rd_min": float(args.cycle_rd_min),
+            "rd_max": float(args.cycle_rd_max),
+            "rd_grid_steps": int(args.cycle_rd_grid_steps),
+            "rd_refine_iters": int(args.cycle_rd_refine_iters),
             "k_best": int(args.cycle_k_best),
             "deg_cap": int(args.cycle_deg_cap),
             "edge_thr": float(args.cycle_edge_thr),

@@ -38,10 +38,13 @@ def sample_n_candidates_from_prior(
     if cond_vals_raw.ndim != 2 or cond_vals_raw.shape[0] != 1 or cond_vals_raw.shape[1] != len(prior.cond_cols):
         raise ValueError("cond_vals_raw must be shape (1, len(prior.cond_cols))")
 
-    rd_t = torch.tensor([[float(rd)]], device=device, dtype=torch.float32)
     cond_raw = cond_vals_raw.to(device=device, dtype=torch.float32)
     cond_t = apply_log_cols_torch(cond_raw, prior.cond_cols, prior.log_cols)
-    x = torch.cat([rd_t, cond_t], dim=-1)
+    if bool(prior.use_rd):
+        rd_t = torch.tensor([[float(rd)]], device=device, dtype=torch.float32)
+        x = torch.cat([rd_t, cond_t], dim=-1)
+    else:
+        x = cond_t
     x_z = prior.scaler.transform_torch(x)
     mu, log_sigma = prior.model(x_z)
     sigma = torch.exp(log_sigma).view(1)
@@ -50,4 +53,3 @@ def sample_n_candidates_from_prior(
     logn = mu.view(1) + sigma * eps
     n = torch.round(torch.exp(logn)).clamp(min=float(min_n), max=float(max_n)).to(torch.int64)
     return clamp_and_unique([int(v) for v in n.detach().cpu().tolist()], min_n=int(min_n), max_n=int(max_n))
-

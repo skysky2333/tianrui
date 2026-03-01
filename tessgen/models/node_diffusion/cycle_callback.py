@@ -25,6 +25,7 @@ def node_bundle_from_lit(*, lit: NodeDiffusionLitModule) -> NodeDiffusionBundle:
         cond_cols=list(lit.cond_cols),
         log_cols=set(lit.log_cols),
         cond_scaler=cond_scaler,
+        use_rd=bool(lit.use_rd),
         k_nn=int(lit.k_nn),
     )
 
@@ -42,6 +43,11 @@ class CycleEvalEveryEpochCallback(pl.Callback):
         device: torch.device,
         out_dir_base: str,
         epoch_rows: int,
+        rd_mode: str,
+        rd_min: float,
+        rd_max: float,
+        rd_grid_steps: int,
+        rd_refine_iters: int,
         k_best: int,
         deg_cap: int,
         min_n: int,
@@ -65,6 +71,11 @@ class CycleEvalEveryEpochCallback(pl.Callback):
         self.device = torch.device(device)
         self.out_dir_base = str(out_dir_base)
         self.epoch_rows = int(epoch_rows)
+        self.rd_mode = str(rd_mode)
+        self.rd_min = float(rd_min)
+        self.rd_max = float(rd_max)
+        self.rd_grid_steps = int(rd_grid_steps)
+        self.rd_refine_iters = int(rd_refine_iters)
         self.k_best = int(k_best)
         self.deg_cap = int(deg_cap)
         self.min_n = int(min_n)
@@ -103,6 +114,11 @@ class CycleEvalEveryEpochCallback(pl.Callback):
             edge_bundle=self.edge_bundle,
             n_prior=self.n_prior,
             device=self.device,
+            rd_mode=str(self.rd_mode),
+            rd_min=float(self.rd_min),
+            rd_max=float(self.rd_max),
+            rd_grid_steps=int(self.rd_grid_steps),
+            rd_refine_iters=int(self.rd_refine_iters),
             k_best=int(self.k_best),
             deg_cap=int(self.deg_cap),
             min_n=int(self.min_n),

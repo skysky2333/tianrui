@@ -15,6 +15,7 @@ from ..constants import COORD_MIN, COORD_RANGE
 from ..data import undirected_to_directed_edge_index
 from ..generation import ddpm_sample_coords, sample_edges_from_coords
 from ..n_select import clamp_and_unique, sample_n_candidates_from_prior
+from ..rd_solve import solve_rd_for_target
 from ..transforms import apply_log_cols_torch, invert_log_cols_torch
 from ..outdirs import finalize_out_dir, make_timestamped_run_dir
 from ..utils import Batch, device_from_arg, set_seed
@@ -32,20 +33,25 @@ def _parse_kv_list(items: list[str]) -> dict[str, float]:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Generate graphs conditioned on metrics (and optionally RD)")
+    p = argparse.ArgumentParser(description="Generate graphs conditioned on metrics; optionally solve RD during scoring")
     p.add_argument(
         "--rd",
         type=float,
         default=None,
-        help="If provided, fix RD. If omitted, search over --rd_candidates and output the best RD in meta_*.json.",
+        help="If provided, fix RD (used for scoring in rd_mode=fixed; used as the RD conditioning value if node diffusion expects RD).",
     )
     p.add_argument(
         "--rd_candidates",
         type=float,
         nargs="+",
         default=[0.01, 0.05, 0.1, 0.15, 0.2],
-        help="Candidate RD values used when --rd is omitted.",
+        help="Candidate RD values (used for rd_mode=fixed when --rd is omitted; also used to condition diffusion when diffusion expects RD and --rd is omitted).",
     )
+    p.add_argument("--rd_mode", type=str, default="fixed", help="How to handle RD during scoring: fixed|solve")
+    p.add_argument("--rd_min", type=float, default=0.01, help="RD solve lower bound (used when rd_mode=solve)")
+    p.add_argument("--rd_max", type=float, default=0.2, help="RD solve upper bound (used when rd_mode=solve)")
+    p.add_argument("--rd_grid_steps", type=int, default=21, help="Coarse grid steps for RD solve (used when rd_mode=solve)")
+    p.add_argument("--rd_refine_iters", type=int, default=24, help="Golden-section refinement iterations (used when rd_mode=solve)")
     p.add_argument("--cond", type=str, nargs="*", default=[], help="Condition values as KEY=VALUE, e.g. RS=0.01")
     p.add_argument("--k", type=int, default=2, help="Samples per (RD, N) combination")
     p.add_argument("--top_m", type=int, default=3, help="How many best samples to save")
@@ -81,6 +87,19 @@ def main() -> None:
     surrogate = load_surrogate(args.surrogate_ckpt, device=device)
     node_bundle = load_node_diffusion(args.node_ckpt, device=device)
     edge_bundle = load_edge_model(args.edge_ckpt, device=device)
+
+    rd_mode_s = str(args.rd_mode)
+    if rd_mode_s not in {"fixed", "solve"}:
+        raise SystemExit(f"--rd_mode must be one of: fixed, solve (got {rd_mode_s!r})")
+    rd_min_f = float(args.rd_min)
+    rd_max_f = float(args.rd_max)
+    if rd_mode_s == "solve" and not (rd_min_f > 0.0 and rd_max_f > rd_min_f):
+        raise SystemExit(f"For --rd_mode solve: expected 0 < --rd_min < --rd_max; got rd_min={rd_min_f} rd_max={rd_max_f}")
+    if rd_mode_s == "solve" and int(args.rd_grid_steps) < 3:
+        raise SystemExit("--rd_grid_steps must be >= 3")
+    if rd_mode_s == "solve" and int(args.rd_refine_iters) < 0:
+        raise SystemExit("--rd_refine_iters must be >= 0")
+
     n_prior = None
     if args.n_nodes is None and not list(args.n_candidates):
         if not str(args.n_prior_ckpt):
@@ -99,13 +118,28 @@ def main() -> None:
             if c not in cond_dict:
                 raise SystemExit(f"Missing required NPrior condition {c}. Provide via --cond {c}=...")
 
-    # RD grid (either fixed, or search over candidates)
-    if args.rd is not None:
-        rd_values = [float(args.rd)]
+    # RD loop values:
+    # - rd_mode=fixed: iterate RD values for scoring (and diffusion conditioning if needed)
+    # - rd_mode=solve: only iterate RD values when diffusion itself needs RD conditioning
+    if rd_mode_s == "fixed":
+        if args.rd is not None:
+            rd_loop_values: list[float | None] = [float(args.rd)]
+        else:
+            rd_loop_values = [float(x) for x in list(args.rd_candidates)]
+            if not rd_loop_values:
+                raise SystemExit("No RD provided: pass --rd, or provide at least one value in --rd_candidates.")
     else:
-        rd_values = [float(x) for x in list(args.rd_candidates)]
-        if not rd_values:
-            raise SystemExit("No RD provided: pass --rd, or provide at least one value in --rd_candidates.")
+        if bool(node_bundle.use_rd):
+            if args.rd is not None:
+                rd_loop_values = [float(args.rd)]
+            else:
+                rd_loop_values = [float(x) for x in list(args.rd_candidates)]
+                if not rd_loop_values:
+                    raise SystemExit(
+                        "Diffusion checkpoint requires RD as conditioning input. Pass --rd, or provide at least one value in --rd_candidates."
+                    )
+        else:
+            rd_loop_values = [None]
     k_per_combo = int(args.k)
     if k_per_combo <= 0:
         raise SystemExit("--k must be >= 1")
@@ -130,8 +164,20 @@ def main() -> None:
 
     results = []
     total = 0
-    n_values_per_rd: dict[float, list[int]] = {}
-    for rd in rd_values:
+    n_values_per_rd: dict[float | None, list[int]] = {}
+    rd_for_prior_default: float
+    if args.rd is not None:
+        rd_for_prior_default = float(args.rd)
+    elif rd_mode_s == "solve":
+        rd_for_prior_default = float(np.sqrt(float(rd_min_f) * float(rd_max_f)))
+    else:
+        rd_cands = [float(x) for x in list(args.rd_candidates)]
+        if not rd_cands:
+            rd_for_prior_default = 0.1
+        else:
+            rd_for_prior_default = float(rd_cands[len(rd_cands) // 2])
+
+    for rd_cond in rd_loop_values:
         if args.n_nodes is not None:
             n_values = [int(args.n_nodes)]
         elif list(args.n_candidates):
@@ -139,9 +185,10 @@ def main() -> None:
         else:
             if n_prior is None or cond_vals_prior_raw is None:
                 raise RuntimeError("Internal error: NPrior expected but not loaded")
+            rd_for_prior = float(rd_cond) if rd_cond is not None else float(rd_for_prior_default)
             n_values = sample_n_candidates_from_prior(
                 n_prior,
-                rd=float(rd),
+                rd=float(rd_for_prior),
                 cond_vals_raw=cond_vals_prior_raw,
                 n_samples=int(args.n_prior_samples),
                 min_n=int(args.min_n),
@@ -150,7 +197,7 @@ def main() -> None:
             )
         if not n_values:
             raise RuntimeError("No N candidates produced")
-        n_values_per_rd[float(rd)] = n_values
+        n_values_per_rd[rd_cond] = n_values
         total += int(len(n_values) * int(k_per_combo))
 
     with tqdm(
@@ -160,16 +207,23 @@ def main() -> None:
         dynamic_ncols=True,
         leave=True,
     ) as pbar:
-        for rd in rd_values:
-            n_values = n_values_per_rd[float(rd)]
+        for rd_cond in rd_loop_values:
+            n_values = n_values_per_rd[rd_cond]
             for n_nodes in n_values:
-                rd_t = torch.tensor([[float(rd)]], device=device, dtype=torch.float32)
                 logn_t = torch.tensor([[float(np.log(float(n_nodes)))]], device=device, dtype=torch.float32)
-                full = torch.cat([rd_t, logn_t, cond_vals], dim=-1)  # (1, 2+Dc)
+                rd_t = None
+                if bool(node_bundle.use_rd):
+                    if rd_cond is None:
+                        raise RuntimeError("Internal error: rd_cond is None but node diffusion requires RD")
+                    rd_t = torch.tensor([[float(rd_cond)]], device=device, dtype=torch.float32)
+                    full = torch.cat([rd_t, logn_t, cond_vals], dim=-1)  # (1, 2+Dc)
+                else:
+                    full = torch.cat([logn_t, cond_vals], dim=-1)  # (1, 1+Dc)
                 cond_z = node_bundle.cond_scaler.transform_torch(full).squeeze(0)
 
                 for _ in range(int(k_per_combo)):
-                    pbar.set_postfix_str(f"step=ddpm rd={rd:.4g} N={int(n_nodes)}", refresh=True)
+                    rd_desc = f"{float(rd_cond):.4g}" if rd_cond is not None else "NA"
+                    pbar.set_postfix_str(f"step=ddpm rd_cond={rd_desc} N={int(n_nodes)}", refresh=True)
                     t_ddpm0 = time.perf_counter()
                     coords01 = ddpm_sample_coords(
                         schedule=node_bundle.schedule,
@@ -181,7 +235,7 @@ def main() -> None:
                     )
                     t_ddpm = float(time.perf_counter() - t_ddpm0)
 
-                    pbar.set_postfix_str(f"step=edge rd={rd:.4g} N={int(n_nodes)} ddpm={t_ddpm:.3g}s", refresh=True)
+                    pbar.set_postfix_str(f"step=edge rd_cond={rd_desc} N={int(n_nodes)} ddpm={t_ddpm:.3g}s", refresh=True)
                     t_edge0 = time.perf_counter()
                     edges_uv = sample_edges_from_coords(
                         edge_bundle=edge_bundle,
@@ -193,38 +247,70 @@ def main() -> None:
                     )
                     t_edge = float(time.perf_counter() - t_edge0)
 
-                    edge_index = undirected_to_directed_edge_index(edges_uv)
-                    batch = Batch(
-                        x=coords01,
-                        edge_index=edge_index.to(device),
-                        batch=torch.zeros((int(n_nodes),), device=device, dtype=torch.long),
-                        rd=rd_t,
-                        y=y_target_z,
-                        n_nodes=torch.tensor([int(n_nodes)], device=device, dtype=torch.long),
-                        n_edges=torch.tensor([int(edges_uv.shape[0])], device=device, dtype=torch.long),
-                    )
+                    edge_index = undirected_to_directed_edge_index(edges_uv).to(device)
 
                     pbar.set_postfix_str(
-                        f"step=surrogate rd={rd:.4g} N={int(n_nodes)} ddpm={t_ddpm:.3g}s edge={t_edge:.3g}s",
+                        f"step=surrogate rd_cond={rd_desc} N={int(n_nodes)} ddpm={t_ddpm:.3g}s edge={t_edge:.3g}s",
                         refresh=True,
                     )
                     t_sur0 = time.perf_counter()
-                    pred_z = surrogate.model(batch)
-                    err = torch.mean((pred_z - y_target_z) ** 2).item()
-                    pred_t = surrogate.scaler.inverse_transform_torch(pred_z)
-                    pred = (
-                        invert_log_cols_torch(pred_t, surrogate.target_cols, surrogate.log_cols)
-                        .squeeze(0)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
+                    rd_used = None
+                    rd_solved = None
+                    rd_hit_bound = None
+                    if rd_mode_s == "fixed":
+                        if rd_cond is None:
+                            raise RuntimeError("Internal error: rd_cond is None but rd_mode=fixed")
+                        rd_used = float(rd_cond)
+                        rd_t_score = torch.tensor([[float(rd_used)]], device=device, dtype=torch.float32)
+                        batch = Batch(
+                            x=coords01,
+                            edge_index=edge_index,
+                            batch=torch.zeros((int(n_nodes),), device=device, dtype=torch.long),
+                            rd=rd_t_score,
+                            y=y_target_z,
+                            n_nodes=torch.tensor([int(n_nodes)], device=device, dtype=torch.long),
+                            n_edges=torch.tensor([int(edges_uv.shape[0])], device=device, dtype=torch.long),
+                        )
+                        pred_z = surrogate.model(batch)
+                        err = torch.mean((pred_z - y_target_z) ** 2).item()
+                        pred_t = surrogate.scaler.inverse_transform_torch(pred_z)
+                        pred = (
+                            invert_log_cols_torch(pred_t, surrogate.target_cols, surrogate.log_cols)
+                            .squeeze(0)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                        )
+                        rd_final = float(rd_used)
+                    else:
+                        solved = solve_rd_for_target(
+                            surrogate=surrogate,
+                            x=coords01,
+                            edge_index=edge_index,
+                            n_nodes=int(n_nodes),
+                            n_edges=int(edges_uv.shape[0]),
+                            y_target_z=y_target_z,
+                            rd_min=float(rd_min_f),
+                            rd_max=float(rd_max_f),
+                            grid_steps=int(args.rd_grid_steps),
+                            refine_iters=int(args.rd_refine_iters),
+                            device=device,
+                        )
+                        err = float(solved["err_best"])
+                        pred = np.asarray(solved["pred_vec_best"], dtype=np.float32)
+                        rd_solved = float(solved["rd_best"])
+                        rd_hit_bound = bool(solved["hit_bound"])
+                        rd_final = float(rd_solved)
                     t_sur = float(time.perf_counter() - t_sur0)
 
                     results.append(
                         {
                             "err": float(err),
-                            "rd": float(rd),
+                            "rd": float(rd_final),
+                            "rd_cond": float(rd_cond) if rd_cond is not None else None,
+                            "rd_used": float(rd_used) if rd_used is not None else None,
+                            "rd_solved": float(rd_solved) if rd_solved is not None else None,
+                            "rd_hit_bound": bool(rd_hit_bound) if rd_hit_bound is not None else None,
                             "n_nodes": int(n_nodes),
                             "n_edges": int(edges_uv.shape[0]),
                             "coords01": coords01.detach().cpu().numpy(),
@@ -234,7 +320,7 @@ def main() -> None:
                     )
 
                     pbar.set_postfix_str(
-                        f"step=done rd={rd:.4g} N={int(n_nodes)} ddpm={t_ddpm:.3g}s edge={t_edge:.3g}s sur={t_sur:.3g}s err_mse_z={err:.3g}",
+                        f"step=done rd={rd_final:.4g} N={int(n_nodes)} ddpm={t_ddpm:.3g}s edge={t_edge:.3g}s sur={t_sur:.3g}s err_mse_z={err:.3g}",
                         refresh=True,
                     )
                     pbar.update(1)
@@ -265,6 +351,11 @@ def main() -> None:
                     "rank": i,
                     "err_mse_z": r["err"],
                     "rd": float(r["rd"]),
+                    "rd_mode": str(rd_mode_s),
+                    "rd_cond": r.get("rd_cond"),
+                    "rd_used": r.get("rd_used"),
+                    "rd_solved": r.get("rd_solved"),
+                    "rd_hit_bound": r.get("rd_hit_bound"),
                     "cond": cond_dict,
                     "n_nodes": r["n_nodes"],
                     "n_edges": r["n_edges"],
@@ -298,8 +389,14 @@ def main() -> None:
                 "run_dir": str(run_dir),
                 "best_err_mse_z": keep[0]["err"] if keep else None,
                 "best_rd": float(best_rd) if best_rd is not None else None,
-                "rd_search": args.rd is None,
-                "rd_candidates": rd_values if args.rd is None else None,
+                "rd_mode": str(rd_mode_s),
+                "rd_fixed": float(args.rd) if args.rd is not None else None,
+                "rd_search": (rd_mode_s == "fixed" and args.rd is None) or (rd_mode_s == "solve"),
+                "rd_candidates": [float(x) for x in list(args.rd_candidates)] if (args.rd is None and list(args.rd_candidates)) else None,
+                "rd_min": float(rd_min_f) if rd_mode_s == "solve" else None,
+                "rd_max": float(rd_max_f) if rd_mode_s == "solve" else None,
+                "rd_grid_steps": int(args.rd_grid_steps) if rd_mode_s == "solve" else None,
+                "rd_refine_iters": int(args.rd_refine_iters) if rd_mode_s == "solve" else None,
                 "k_per_combo": int(k_per_combo),
                 "deg_cap": int(args.deg_cap),
                 "edge_thr": float(args.edge_thr),

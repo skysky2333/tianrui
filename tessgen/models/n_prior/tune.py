@@ -31,6 +31,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tess_root", type=str, default="data/Tessellation_Dataset")
     p.add_argument("--cond_cols", type=str, nargs="+", required=True)
     p.add_argument("--log_cols", type=str, nargs="*", default=["RS"])
+    p.add_argument("--use_rd", action=argparse.BooleanOptionalAction, default=True, help="Include RD as an input feature")
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="auto")
@@ -49,10 +50,23 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _fit_x_scaler(df: pd.DataFrame, rows: list[int], cond_cols: list[str], log_cols: set[str]) -> StandardScaler:
-    x = df.loc[rows, ["RD"] + cond_cols].to_numpy(dtype=np.float32)
-    x_t = torch.from_numpy(x)
-    x_t[:, 1:] = apply_log_cols_torch(x_t[:, 1:], cond_cols, log_cols)
+def _fit_x_scaler(
+    df: pd.DataFrame,
+    rows: list[int],
+    cond_cols: list[str],
+    log_cols: set[str],
+    *,
+    use_rd: bool,
+) -> StandardScaler:
+    use_rd = bool(use_rd)
+    if use_rd:
+        x = df.loc[rows, ["RD"] + cond_cols].to_numpy(dtype=np.float32)
+        x_t = torch.from_numpy(x)
+        x_t[:, 1:] = apply_log_cols_torch(x_t[:, 1:], cond_cols, log_cols)
+    else:
+        x = df.loc[rows, cond_cols].to_numpy(dtype=np.float32)
+        x_t = torch.from_numpy(x)
+        x_t[:, :] = apply_log_cols_torch(x_t[:, :], cond_cols, log_cols)
     return StandardScaler.fit(x_t.numpy())
 
 
@@ -64,6 +78,7 @@ def main() -> None:
 
     cond_cols = list(args.cond_cols)
     log_cols = set(args.log_cols or [])
+    use_rd = bool(args.use_rd)
     dev = lightning_device_from_arg(args.device)
     num_workers = int(args.num_workers)
     dl_kwargs = {"num_workers": num_workers, "persistent_workers": num_workers > 0, "pin_memory": dev.accelerator == "gpu"}
@@ -74,7 +89,7 @@ def main() -> None:
     df = pd.read_csv(args.data_csv)
     train_rows = rows_for_graph_ids(len(df), train_g)
     val_rows = rows_for_graph_ids(len(df), val_g)
-    scaler = _fit_x_scaler(df, train_rows, cond_cols, log_cols)
+    scaler = _fit_x_scaler(df, train_rows, cond_cols, log_cols, use_rd=use_rd)
 
     ds_train = NPriorRowDataset(data_csv=args.data_csv, tess_root=args.tess_root, cond_cols=cond_cols, row_indices=train_rows)
     ds_val = NPriorRowDataset(data_csv=args.data_csv, tess_root=args.tess_root, cond_cols=cond_cols, row_indices=val_rows)
@@ -109,6 +124,7 @@ def main() -> None:
             log_cols=sorted(log_cols),
             scaler_mean=scaler.mean.tolist(),
             scaler_std=scaler.std.tolist(),
+            use_rd=use_rd,
             lr=float(lr),
             weight_decay=float(wd),
         )
@@ -158,6 +174,7 @@ def main() -> None:
         "tess_root": args.tess_root,
         "cond_cols": cond_cols,
         "log_cols": sorted(log_cols),
+        "use_rd": bool(use_rd),
         "val_frac": float(args.val_frac),
         "device": {"accelerator": dev.accelerator, "devices": dev.devices},
         "search_space": {"sigma_min": sigma_min_spec},

@@ -37,6 +37,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tess_root", type=str, default="data/Tessellation_Dataset")
     p.add_argument("--cond_cols", type=str, nargs="+", required=True)
     p.add_argument("--log_cols", type=str, nargs="*", default=["RS"])
+    p.add_argument("--use_rd", action=argparse.BooleanOptionalAction, default=True, help="Include RD as an input feature")
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="auto")
@@ -69,16 +70,37 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _fit_cond_scaler(df: pd.DataFrame, rows: list[int], *, tess_root: str, cond_cols: list[str], log_cols: set[str]) -> StandardScaler:
+def _fit_cond_scaler(
+    df: pd.DataFrame,
+    rows: list[int],
+    *,
+    tess_root: str,
+    cond_cols: list[str],
+    log_cols: set[str],
+    use_rd: bool,
+) -> StandardScaler:
     store = GraphStore(tess_root=tess_root)
     graph_ids = sorted({(int(r) // 5) + 1 for r in rows})
     logn_by_gid = {gid: float(np.log(float(store.get(gid).n_nodes))) for gid in graph_ids}
 
-    base = df.loc[rows, ["RD"] + cond_cols].to_numpy(dtype=np.float32)
+    use_rd = bool(use_rd)
+    if use_rd:
+        base = df.loc[rows, ["RD"] + cond_cols].to_numpy(dtype=np.float32)
+        rd = base[:, 0:1]
+        cond = base[:, 1:]
+    else:
+        base = df.loc[rows, cond_cols].to_numpy(dtype=np.float32)
+        rd = None
+        cond = base
     logn = np.array([logn_by_gid[(int(r) // 5) + 1] for r in rows], dtype=np.float32).reshape(-1, 1)
-    x = np.concatenate([base[:, 0:1], logn, base[:, 1:]], axis=1)
+    if rd is None:
+        x = np.concatenate([logn, cond], axis=1)
+        cond_start = 1
+    else:
+        x = np.concatenate([rd, logn, cond], axis=1)
+        cond_start = 2
     x_t = torch.from_numpy(x)
-    x_t[:, 2:] = apply_log_cols_torch(x_t[:, 2:], cond_cols, log_cols)
+    x_t[:, cond_start:] = apply_log_cols_torch(x_t[:, cond_start:], cond_cols, log_cols)
     return StandardScaler.fit(x_t.numpy())
 
 
@@ -90,6 +112,7 @@ def main() -> None:
 
     cond_cols = list(args.cond_cols)
     log_cols = set(args.log_cols or [])
+    use_rd = bool(args.use_rd)
 
     graph_ids = discover_graph_ids(args.tess_root)
     train_g, val_g = train_val_split_graph_ids(graph_ids, val_frac=float(args.val_frac), seed=int(args.seed))
@@ -97,7 +120,14 @@ def main() -> None:
     df = pd.read_csv(args.data_csv)
     train_rows = rows_for_graph_ids(len(df), train_g)
     val_rows = rows_for_graph_ids(len(df), val_g)
-    cond_scaler = _fit_cond_scaler(df, train_rows, tess_root=args.tess_root, cond_cols=cond_cols, log_cols=log_cols)
+    cond_scaler = _fit_cond_scaler(
+        df,
+        train_rows,
+        tess_root=args.tess_root,
+        cond_cols=cond_cols,
+        log_cols=log_cols,
+        use_rd=use_rd,
+    )
 
     ds_train = TessellationRowDataset(
         data_csv=args.data_csv,
@@ -165,7 +195,7 @@ def main() -> None:
 
         schedule_cfg = DiffusionConfig(n_steps=steps, beta_start=beta_start, beta_end=beta_end)
         den_cfg = NodeDenoiserConfig(
-            cond_dim=2 + len(cond_cols),
+            cond_dim=(2 + len(cond_cols)) if use_rd else (1 + len(cond_cols)),
             d_h=trial.suggest_categorical("d_h", [64, 96, 128, 160, 192]),
             n_layers=trial.suggest_int("n_layers", 2, 5),
             n_rbf=trial.suggest_categorical("n_rbf", [8, 16, 24]),
@@ -181,6 +211,7 @@ def main() -> None:
             log_cols=sorted(log_cols),
             cond_scaler_mean=cond_scaler.mean.tolist(),
             cond_scaler_std=cond_scaler.std.tolist(),
+            use_rd=use_rd,
             k_nn=k_nn,
             lr=float(lr),
             weight_decay=float(wd),
@@ -231,6 +262,7 @@ def main() -> None:
         "tess_root": args.tess_root,
         "cond_cols": cond_cols,
         "log_cols": sorted(log_cols),
+        "use_rd": bool(use_rd),
         "val_frac": float(args.val_frac),
         "device": {"accelerator": dev.accelerator, "devices": dev.devices},
         "search_space": {"k_nn": k_nn_choices, "steps": steps_choices, "beta_start": beta_start_spec, "beta_end": beta_end_spec},

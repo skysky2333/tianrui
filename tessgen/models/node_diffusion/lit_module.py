@@ -23,6 +23,7 @@ class NodeDiffusionLitModule(pl.LightningModule):
         log_cols: list[str],
         cond_scaler_mean: list[float],
         cond_scaler_std: list[float],
+        use_rd: bool = True,
         k_nn: int,
         lr: float,
         weight_decay: float = 1e-2,
@@ -38,6 +39,7 @@ class NodeDiffusionLitModule(pl.LightningModule):
 
         self.cond_cols = list(cond_cols)
         self.log_cols = set(log_cols)
+        self.use_rd = bool(use_rd)
         self.k_nn = int(k_nn)
         self.lr = float(lr)
         self.weight_decay = float(weight_decay)
@@ -56,11 +58,14 @@ class NodeDiffusionLitModule(pl.LightningModule):
         return batch
 
     def _cond_to_z(self, sample: dict) -> torch.Tensor:
-        rd = sample["rd"].view(1, 1).to(self.device)  # (1,1)
         logn = sample["logn"].view(1, 1).to(self.device)  # (1,1)
         cond = sample["cond"].view(1, -1).to(self.device)  # (1,Dc)
         cond = apply_log_cols_torch(cond, self.cond_cols, self.log_cols)
-        full = torch.cat([rd, logn, cond], dim=-1)  # (1, 2+Dc)
+        if self.use_rd:
+            rd = sample["rd"].view(1, 1).to(self.device)  # (1,1)
+            full = torch.cat([rd, logn, cond], dim=-1)  # (1, 2+Dc)
+        else:
+            full = torch.cat([logn, cond], dim=-1)  # (1, 1+Dc)
         return ((full - self.cond_scaler_mean) / self.cond_scaler_std).squeeze(0)
 
     def _step(self, sample: dict, stage: str) -> torch.Tensor:
@@ -116,6 +121,7 @@ def export_node_diffusion_pt(
             "schedule_cfg": dict(lit.hparams["schedule_cfg"]),
             "cond_cols": lit.cond_cols,
             "log_cols": sorted(lit.log_cols),
+            "use_rd": bool(lit.use_rd),
             "cond_scaler_mean": lit.cond_scaler_mean.detach().cpu().tolist(),
             "cond_scaler_std": lit.cond_scaler_std.detach().cpu().tolist(),
             "k_nn": int(lit.k_nn),

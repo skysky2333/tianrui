@@ -40,6 +40,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--n_prior_samples", type=int, default=12)
     p.add_argument("--device", type=str, default="auto")
 
+    p.add_argument("--rd_mode", type=str, default="fixed", help="How to handle RD during scoring: fixed|solve")
+    p.add_argument("--rd_min", type=float, default=0.01, help="RD solve lower bound (used when rd_mode=solve)")
+    p.add_argument("--rd_max", type=float, default=0.2, help="RD solve upper bound (used when rd_mode=solve)")
+    p.add_argument("--rd_grid_steps", type=int, default=21, help="Coarse grid steps for RD solve (used when rd_mode=solve)")
+    p.add_argument("--rd_refine_iters", type=int, default=24, help="Golden-section refinement iterations (used when rd_mode=solve)")
+
     p.add_argument("--out_dir", type=str, required=True)
     p.add_argument("--save_row_figs", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--save_graph_files", action=argparse.BooleanOptionalAction, default=False)
@@ -87,6 +93,11 @@ def main() -> None:
         edge_bundle=edge_bundle,
         n_prior=n_prior,
         device=device,
+        rd_mode=str(args.rd_mode),
+        rd_min=float(args.rd_min),
+        rd_max=float(args.rd_max),
+        rd_grid_steps=int(args.rd_grid_steps),
+        rd_refine_iters=int(args.rd_refine_iters),
         k_best=int(args.k_best),
         deg_cap=int(args.deg_cap),
         min_n=int(args.min_n),

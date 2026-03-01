@@ -20,6 +20,7 @@ class NPriorLitModule(pl.LightningModule):
         log_cols: list[str],
         scaler_mean: list[float],
         scaler_std: list[float],
+        use_rd: bool = True,
         lr: float,
         weight_decay: float = 1e-2,
     ):
@@ -27,7 +28,9 @@ class NPriorLitModule(pl.LightningModule):
         self.save_hyperparameters()
 
         cfg_obj = NPriorConfig(**cfg)
-        self.model = NPriorModel(x_dim=1 + len(cond_cols), cfg=cfg_obj)
+        self.use_rd = bool(use_rd)
+        x_dim = (1 + len(cond_cols)) if self.use_rd else len(cond_cols)
+        self.model = NPriorModel(x_dim=x_dim, cfg=cfg_obj)
 
         self.cond_cols = list(cond_cols)
         self.log_cols = set(log_cols)
@@ -44,10 +47,13 @@ class NPriorLitModule(pl.LightningModule):
         return self.model.cfg
 
     def inputs_to_z(self, *, rd: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        rd = rd.view(rd.shape[0], 1)
         cond = cond.view(cond.shape[0], -1)
         cond_t = apply_log_cols_torch(cond, self.cond_cols, self.log_cols)
-        x = torch.cat([rd, cond_t], dim=-1)
+        if self.use_rd:
+            rd = rd.view(rd.shape[0], 1)
+            x = torch.cat([rd, cond_t], dim=-1)
+        else:
+            x = cond_t
         return (x - self.scaler_mean) / self.scaler_std
 
     def forward(self, *, rd: torch.Tensor, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -93,10 +99,10 @@ def export_n_prior_pt(*, lit: NPriorLitModule, out_path: str, val_nll: float | N
             "cfg": asdict(lit.cfg),
             "cond_cols": lit.cond_cols,
             "log_cols": sorted(lit.log_cols),
+            "use_rd": bool(lit.use_rd),
             "scaler_mean": lit.scaler_mean.detach().cpu().tolist(),
             "scaler_std": lit.scaler_std.detach().cpu().tolist(),
             "val_nll": float(val_nll) if val_nll is not None else None,
         },
         out_path,
     )
-

@@ -81,7 +81,7 @@ Latest top-level artifacts are also copied into `runs/surrogate/` (see `runs/sur
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.train_edge \
-  --epochs 32 \
+  --epochs 48 \
   --out_dir runs/edge \
   --device cpu \
   --cand_mode delaunay \
@@ -124,13 +124,14 @@ conda run -n tianrui python -m tessgen.cli.train_edge_3 \
 ```
 
 
-4) Train an N prior (RD + metrics → log(N)):
+4) Train an N prior (metrics [+ optional RD] → log(N)):
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.train_n_prior \
   --data_csv data/Data_2.csv \
   --cond_cols RS \
   --epochs 16 \
+  --no-use_rd \
   --out_dir runs/n_prior \
   --device cpu
 ```
@@ -143,13 +144,14 @@ Outputs in `runs/n_prior/<timestamp>/` (full run):
 
 Latest top-level artifacts are also copied into `runs/n_prior/` (see `runs/n_prior/latest_run.json`).
 
-5) Train a node diffusion model (RD + logN + metrics → coords):
+5) Train a node diffusion model (logN + metrics [+ optional RD] → coords):
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
   --data_csv data/Data_2.csv \
   --cond_cols RS \
   --epochs 16 \
+  --no-use_rd \
   --out_dir runs/node_diffusion \
   --device cpu
 ```
@@ -162,16 +164,17 @@ end of **every epoch** and `best.ckpt` is selected by `val/cycle_r_best`:
 conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
   --data_csv data/Data_2.csv \
   --cond_cols RS \
-  --epochs 32 \
+  --epochs 16 \
+  --no-use_rd \
   --out_dir runs/node_diffusion \
   --device cpu \
   --cycle_surrogate_ckpt runs/surrogate/surrogate.pt \
   --cycle_edge_ckpt runs/edge/edge_model.pt \
-  --cycle_k_best 8 \
+  --cycle_rd_mode solve \
   --cycle_edge_thr 0.5 \
   --cycle_epoch_rows 10 \
   --report_max_samples 20 \
-  --cycle_k_best 16
+  --cycle_k_best 8
 ```
 
 To disable the per-epoch validation cycle eval (and monitor `val/loss` instead), add `--no-cycle_each_epoch`.
@@ -192,7 +195,7 @@ If per-epoch cycle eval is enabled (default when cycle ckpts are provided), outp
 - `runs/node_diffusion/<timestamp>/cycle_val/epoch_###/`
 and `figures/cycle_r_over_epoch.png` is generated from `history.jsonl`.
 
-6) Generate candidate graphs for a target `(RD, RS)`:
+6) Generate candidate graphs for target metrics (e.g. `RS`), optionally with a fixed `RD`:
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.generate \
@@ -214,16 +217,18 @@ Notes:
 - Conditioning on **more than RS** will generally produce tighter, more identifiable generations.
 - If you omit `--n_nodes`, provide either `--n_candidates` (grid search) or `--n_prior_ckpt` (sample candidate N values).
 
-7) (Optional) Infer `RD` given only metrics (e.g. only `RS`):
+7) Infer `RD` given only metrics (e.g. only `RS`):
 
-If you omit `--rd`, the generator will search over `--rd_candidates` (defaults to `0.01 0.05 0.1 0.15 0.2`) and pick
-the best sample by surrogate score. When searching, `--k` is interpreted as **samples per (RD, N) combination**.
-The chosen `RD` is written to `meta_*.json` and printed as `best_rd`.
+Two options:
+- Discrete search over `--rd_candidates` (`--rd_mode fixed`, default). When searching, `--k` is interpreted as samples per (RD, N) combination.
+- Continuous solve with the surrogate (`--rd_mode solve`), which finds `RD ∈ [--rd_min, --rd_max]` per generated graph.
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.generate \
   --cond RS=0.01 \
-  --rd_candidates 0.01 0.05 0.1 0.15 0.2 \
+  --rd_mode solve \
+  --rd_min 0.01 \
+  --rd_max 0.2 \
   --n_prior_ckpt runs/n_prior/n_prior.pt \
   --n_prior_samples 12 \
   --k 2 \
@@ -238,9 +243,10 @@ conda run -n tianrui python -m tessgen.cli.generate \
 
 8) End-to-end benchmark on the test split (metrics → graph → surrogate → metrics):
 
-This evaluates the full pipeline by taking test-set metrics (e.g. `RS`) + true `RD`, generating a graph with the
+This evaluates the full pipeline by taking test-set metrics (e.g. `RS`), generating a graph with the
 node diffusion + edge model, then predicting metrics with the surrogate and benchmarking correlation/error vs the
-original test metrics.
+original test metrics. By default this uses the dataset `RD` values (`--rd_mode fixed`); use `--rd_mode solve` if you
+want to treat `RD` as a free design variable during scoring.
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.benchmark_cycle \
@@ -249,6 +255,7 @@ conda run -n tianrui python -m tessgen.cli.benchmark_cycle \
   --node_ckpt runs/node_diffusion/node_diffusion.pt \
   --edge_ckpt runs/edge/edge_model.pt \
   --edge_thr 0.5 \
+  --rd_mode solve \
   --out_dir out/bench_cycle \
   --device cpu
 ```
