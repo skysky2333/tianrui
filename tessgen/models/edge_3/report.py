@@ -6,9 +6,9 @@ import numpy as np
 import torch
 from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score, roc_curve as roc_curve_fn  # type: ignore
 
-from .lit_module import EdgeLitModule
-from .core import label_candidate_pairs
-from ...graph_utils import candidate_pairs, pairs_to_edge_index
+from .lit_module import Edge3LitModule
+from ..edge.core import label_candidate_pairs
+from ...graph_utils import candidate_pairs, knn_candidate_pairs, pairs_to_edge_index
 from ...reporting import mpl_setup, read_jsonl, save_histogram, save_line_plot, write_json
 
 
@@ -17,9 +17,9 @@ def _safe_mean(xs: list[float]) -> float:
 
 
 @torch.no_grad()
-def eval_edge_model(
+def eval_edge3_model(
     *,
-    lit: EdgeLitModule,
+    lit: Edge3LitModule,
     dl,
     thr: float,
     max_pairs: int = 2_000_000,
@@ -42,8 +42,13 @@ def eval_edge_model(
         coords01 = coords01_cpu.to(lit.device)
         cand_t = torch.from_numpy(cand).to(device=lit.device, dtype=torch.long)
         y_t = torch.from_numpy(y).to(device=lit.device, dtype=torch.float32)
-        msg_edge_index = pairs_to_edge_index(cand).to(lit.device)
-        logits = lit.model(coords01=coords01, msg_edge_index=msg_edge_index, cand_pairs_uv=cand_t)
+
+        h0 = lit.model.node_in(coords01)
+        s = lit.model.search_proj(h0)
+        msg_pairs = knn_candidate_pairs(s.detach().cpu().numpy(), k=int(lit.k_msg))
+        msg_edge_index = pairs_to_edge_index(msg_pairs).to(lit.device)
+
+        logits = lit.model(coords01=coords01, msg_edge_index=msg_edge_index, cand_pairs_uv=cand_t, h0=h0)
         bce = float(torch.nn.functional.binary_cross_entropy_with_logits(logits, y_t).detach().cpu())
         probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
 
@@ -71,7 +76,6 @@ def eval_edge_model(
     recall = tp / (tp + fn + 1e-12)
     f1 = (2.0 * precision * recall) / (precision + recall + 1e-12)
 
-    # Ranking metrics (may be nan if only one class)
     ap = float("nan")
     auc = float("nan")
     pr_curve = None
@@ -111,7 +115,6 @@ def make_report_and_figures(
     figs = run / "figures"
     figs.mkdir(parents=True, exist_ok=True)
 
-    # Loss curves
     hist = read_jsonl(history_path)
     epochs = [int(r["epoch"]) for r in hist]
     train = [float(r["train/bce"]) for r in hist]
@@ -120,7 +123,7 @@ def make_report_and_figures(
         out_path=str(figs / "loss_bce.png"),
         x=epochs,
         ys={"train/bce": train, "val/bce": val},
-        title="Edge model loss (BCE)",
+        title="Edge_3 model loss (BCE)",
         xlabel="epoch",
         ylabel="BCE",
     )
@@ -128,13 +131,12 @@ def make_report_and_figures(
         out_path=str(figs / "loss_bce_logy.png"),
         x=epochs,
         ys={"train/bce": train, "val/bce": val},
-        title="Edge model loss (BCE, log y)",
+        title="Edge_3 model loss (BCE, log y)",
         xlabel="epoch",
         ylabel="BCE",
         y_scale="log",
     )
 
-    # Preview metrics (if enabled during training)
     if any("val/preview_mean_deg_pred" in r for r in hist):
         deg_true = [float(r.get("val/preview_mean_deg_true", float("nan"))) for r in hist]
         deg_pred = [float(r.get("val/preview_mean_deg_pred", float("nan"))) for r in hist]
@@ -142,7 +144,7 @@ def make_report_and_figures(
             out_path=str(figs / "preview_mean_degree.png"),
             x=epochs,
             ys={"val/preview_mean_deg_true": deg_true, "val/preview_mean_deg_pred": deg_pred},
-            title="Edge preview: mean degree",
+            title="Edge_3 preview: mean degree",
             xlabel="epoch",
             ylabel="mean degree",
         )
@@ -152,12 +154,11 @@ def make_report_and_figures(
             out_path=str(figs / "preview_edge_ratio.png"),
             x=epochs,
             ys={"val/preview_edge_ratio_mean": ratio},
-            title="Edge preview: edge count ratio (pred/true)",
+            title="Edge_3 preview: edge count ratio (pred/true)",
             xlabel="epoch",
             ylabel="ratio",
         )
 
-    # Surrogate RS correlation (if cycle callback enabled during training)
     if any("val/surrogate_rs_r" in r for r in hist):
         rs_r = [float(r.get("val/surrogate_rs_r", float("nan"))) for r in hist]
         save_line_plot(
@@ -172,7 +173,6 @@ def make_report_and_figures(
     probs = test_eval.pop("probs")
     labels = test_eval.pop("labels")
 
-    # Prob hist
     if len(probs) > 0:
         pos = probs[labels > 0.5].tolist()
         neg = probs[labels <= 0.5].tolist()
@@ -181,7 +181,6 @@ def make_report_and_figures(
         if neg:
             save_histogram(out_path=str(figs / "prob_hist_neg.png"), values=neg, title="P(edge) for negatives", xlabel="p", bins=60)
 
-    # PR / ROC curves
     mpl_setup()
     import matplotlib.pyplot as plt
 
@@ -208,5 +207,5 @@ def make_report_and_figures(
         plt.savefig(str(figs / "roc_curve.png"), dpi=160)
         plt.close()
 
-    report = {"task": "edge_model", "test": test_eval, "figures_dir": str(figs)}
+    report = {"task": "edge_3_model", "test": test_eval, "figures_dir": str(figs)}
     write_json(str(run / "report.json"), report)

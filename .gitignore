@@ -1,7 +1,7 @@
 /.DS_Store
-/data
-/out
-/runs
+/data*
+/out*
+/runs*
 tessgen/__pycache__/
 tessgen/cli/__pycache__/
 tessgen/models/node_diffusion/__pycache__/
@@ -11,3 +11,4 @@ tessgen/models/surrogate/__pycache__/
 tessgen/models/edge/__pycache__/
 
 agent.md
+tessgen/models/edge_3/__pycache__/

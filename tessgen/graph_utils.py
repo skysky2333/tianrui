@@ -4,26 +4,26 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from scipy.spatial import cKDTree
+from scipy.spatial import Delaunay, cKDTree
 
 
-def knn_candidate_pairs(coords01: np.ndarray, k: int) -> np.ndarray:
+def knn_candidate_pairs(coords: np.ndarray, k: int) -> np.ndarray:
     """
     Build an undirected candidate set of edges via kNN.
 
     Returns pairs (u,v) with u<v, shape (M,2).
     """
-    if coords01.ndim != 2 or coords01.shape[1] != 2:
-        raise ValueError("coords01 must be (N,2)")
-    n = coords01.shape[0]
+    if coords.ndim != 2 or coords.shape[1] < 1:
+        raise ValueError("coords must be (N,D) with D>=1")
+    n = coords.shape[0]
     if n == 0:
         return np.zeros((0, 2), dtype=np.int64)
     k = int(k)
     if k <= 0:
         return np.zeros((0, 2), dtype=np.int64)
     k_eff = min(k + 1, n)  # +1 includes self
-    tree = cKDTree(coords01)
-    nn = tree.query(coords01, k=k_eff)[1]  # (N, k_eff)
+    tree = cKDTree(coords)
+    nn = tree.query(coords, k=k_eff)[1]  # (N, k_eff)
     if k_eff <= 1:
         return np.zeros((0, 2), dtype=np.int64)
 
@@ -40,6 +40,69 @@ def knn_candidate_pairs(coords01: np.ndarray, k: int) -> np.ndarray:
     pairs = np.stack([u, v], axis=1)
     pairs = np.unique(pairs, axis=0)
     return pairs
+
+
+def radius_candidate_pairs(coords: np.ndarray, radius: float) -> np.ndarray:
+    """
+    Build an undirected candidate set of edges via a radius / epsilon ball graph.
+
+    Returns pairs (u,v) with u<v, shape (M,2).
+    """
+    if coords.ndim != 2 or coords.shape[1] < 1:
+        raise ValueError("coords must be (N,D) with D>=1")
+    n = coords.shape[0]
+    if n == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    r = float(radius)
+    if r <= 0.0:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    tree = cKDTree(coords)
+    pairs_set = tree.query_pairs(r)
+    if not pairs_set:
+        return np.zeros((0, 2), dtype=np.int64)
+    pairs = np.array(sorted((int(a), int(b)) for a, b in pairs_set), dtype=np.int64)
+    return pairs
+
+
+def delaunay_candidate_pairs(coords01: np.ndarray) -> np.ndarray:
+    """
+    Build an undirected candidate set of edges via 2D Delaunay triangulation.
+
+    Returns pairs (u,v) with u<v, shape (M,2).
+    """
+    if coords01.ndim != 2 or coords01.shape[1] != 2:
+        raise ValueError("coords01 must be (N,2)")
+    n = int(coords01.shape[0])
+    if n < 3:
+        return np.zeros((0, 2), dtype=np.int64)
+
+    tri = Delaunay(coords01)
+    simplices = tri.simplices  # (T,3) for 2D
+    edges: set[tuple[int, int]] = set()
+    for a, b, c in simplices.tolist():
+        for u, v in ((a, b), (b, c), (c, a)):
+            u_i = int(u)
+            v_i = int(v)
+            if u_i == v_i:
+                continue
+            x, y = (u_i, v_i) if u_i < v_i else (v_i, u_i)
+            edges.add((x, y))
+
+    if not edges:
+        return np.zeros((0, 2), dtype=np.int64)
+    pairs = np.array(sorted(edges), dtype=np.int64)
+    return pairs
+
+
+def candidate_pairs(coords01: np.ndarray, *, cand_mode: str, k: int) -> np.ndarray:
+    mode = str(cand_mode)
+    if mode == "knn":
+        return knn_candidate_pairs(coords01, k=int(k))
+    if mode == "delaunay":
+        return delaunay_candidate_pairs(coords01)
+    raise ValueError(f"Unsupported cand_mode={cand_mode!r} (expected 'knn'|'delaunay')")
 
 
 def pairs_to_edge_index(pairs_undirected: np.ndarray) -> torch.Tensor:

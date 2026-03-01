@@ -184,9 +184,8 @@ def main() -> None:
                     pbar.set_postfix_str(f"step=edge rd={rd:.4g} N={int(n_nodes)} ddpm={t_ddpm:.3g}s", refresh=True)
                     t_edge0 = time.perf_counter()
                     edges_uv = sample_edges_from_coords(
-                        edge_model=edge_bundle.model,
+                        edge_bundle=edge_bundle,
                         coords01=coords01,
-                        k=edge_bundle.k,
                         deg_cap=int(args.deg_cap),
                         edge_thr=float(args.edge_thr),
                         ensure_connected=True,

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from .edge_model import EdgeModel, EdgeModelConfig
+from .models.edge_3 import Edge3Model, Edge3ModelConfig
 from .n_prior import NPriorConfig, NPriorModel
 from .node_diffusion import DiffusionConfig, DiffusionSchedule, NodeDenoiser, NodeDenoiserConfig
 from .scaler import StandardScaler
@@ -34,18 +35,32 @@ def load_surrogate(ckpt_path: str, *, device: torch.device) -> SurrogateBundle:
 
 @dataclass(frozen=True)
 class EdgeBundle:
-    model: EdgeModel
+    model: EdgeModel | Edge3Model
+    variant: str
+    cand_mode: str
     k: int
+    k_msg: int | None
 
 
 def load_edge_model(ckpt_path: str, *, device: torch.device) -> EdgeBundle:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    cfg = EdgeModelConfig(**ckpt["cfg"])
+    variant = str(ckpt["variant"])
+    cand_mode = str(ckpt["cand_mode"])
     k = int(ckpt["k"])
-    model = EdgeModel(cfg=cfg).to(device)
-    model.load_state_dict(ckpt["model_state"])
-    model.eval()
-    return EdgeBundle(model=model, k=k)
+    if variant == "edge":
+        cfg = EdgeModelConfig(**ckpt["cfg"])
+        model = EdgeModel(cfg=cfg).to(device)
+        model.load_state_dict(ckpt["model_state"])
+        model.eval()
+        return EdgeBundle(model=model, variant=variant, cand_mode=cand_mode, k=k, k_msg=None)
+    if variant == "edge_3":
+        cfg = Edge3ModelConfig(**ckpt["cfg"])
+        k_msg = int(ckpt["k_msg"])
+        model = Edge3Model(cfg=cfg).to(device)
+        model.load_state_dict(ckpt["model_state"])
+        model.eval()
+        return EdgeBundle(model=model, variant=variant, cand_mode=cand_mode, k=k, k_msg=k_msg)
+    raise ValueError(f"Unsupported edge variant={variant!r} (expected 'edge'|'edge_3')")
 
 
 @dataclass(frozen=True)

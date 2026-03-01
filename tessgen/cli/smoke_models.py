@@ -7,6 +7,7 @@ import torch
 from ..data import TessellationRowDataset, collate_graph_batch
 from ..edge_model import EdgeModel, EdgeModelConfig
 from ..graph_utils import knn_candidate_pairs, pairs_to_edge_index
+from ..models.edge_3 import Edge3Model, Edge3ModelConfig
 from ..node_diffusion import DiffusionConfig, DiffusionSchedule, NodeDenoiser, NodeDenoiserConfig
 from ..surrogate import SurrogateConfig, SurrogateModel
 from ..utils import device_from_arg
@@ -49,6 +50,18 @@ def main() -> None:
         cand_pairs_uv=torch.from_numpy(cand).to(device),
     )
     print("edge_logits", tuple(logits.shape))
+
+    edge3_model = Edge3Model(cfg=Edge3ModelConfig(d_h=64, n_layers=2, d_search=8)).to(device)
+    h0 = edge3_model.node_in(coords.to(device))
+    s = edge3_model.search_proj(h0)
+    msg_pairs = knn_candidate_pairs(s.detach().cpu().numpy(), k=8)
+    logits3 = edge3_model(
+        coords01=coords.to(device),
+        msg_edge_index=pairs_to_edge_index(msg_pairs).to(device),
+        cand_pairs_uv=torch.from_numpy(cand).to(device),
+        h0=h0,
+    )
+    print("edge3_logits", tuple(logits3.shape))
 
     schedule = DiffusionSchedule(DiffusionConfig(n_steps=10)).to(device)
     denoiser = NodeDenoiser(NodeDenoiserConfig(cond_dim=2, d_h=64, n_layers=2)).to(device)

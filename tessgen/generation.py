@@ -5,8 +5,9 @@ import math
 import numpy as np
 import torch
 
-from .edge_model import EdgeModel
+from .ckpt import EdgeBundle
 from .graph_utils import (
+    candidate_pairs,
     ensure_connected_by_candidates,
     enforce_degree_cap,
     knn_candidate_pairs,
@@ -55,9 +56,8 @@ def ddpm_sample_coords(
 @torch.no_grad()
 def sample_edges_from_coords(
     *,
-    edge_model: EdgeModel,
+    edge_bundle: EdgeBundle,
     coords01: torch.Tensor,  # (N,2)
-    k: int,
     deg_cap: int = 12,
     edge_thr: float = 0.5,
     ensure_connected: bool = True,
@@ -68,12 +68,26 @@ def sample_edges_from_coords(
         raise ValueError(f"edge_thr must be in [0,1]; got {edge_thr}")
 
     coords_np = coords01.detach().cpu().numpy()
-    cand = knn_candidate_pairs(coords_np, k=int(k))
+    cand = candidate_pairs(coords_np, cand_mode=edge_bundle.cand_mode, k=int(edge_bundle.k))
     if cand.shape[0] == 0:
         return np.zeros((0, 2), dtype=np.int64)
     cand_t = torch.from_numpy(cand).to(device=device, dtype=torch.long)
-    msg_edge_index = pairs_to_edge_index(cand).to(device)
-    logits = edge_model(coords01=coords01.to(device), msg_edge_index=msg_edge_index, cand_pairs_uv=cand_t)
+
+    coords01_device = coords01.to(device)
+    if edge_bundle.variant == "edge":
+        msg_edge_index = pairs_to_edge_index(cand).to(device)
+        logits = edge_bundle.model(coords01=coords01_device, msg_edge_index=msg_edge_index, cand_pairs_uv=cand_t)
+    elif edge_bundle.variant == "edge_3":
+        if edge_bundle.k_msg is None:
+            raise ValueError("edge_bundle.k_msg must be set for variant='edge_3'")
+        h0 = edge_bundle.model.node_in(coords01_device)
+        s = edge_bundle.model.search_proj(h0)
+        msg_pairs = knn_candidate_pairs(s.detach().cpu().numpy(), k=int(edge_bundle.k_msg))
+        msg_edge_index = pairs_to_edge_index(msg_pairs).to(device)
+        logits = edge_bundle.model(coords01=coords01_device, msg_edge_index=msg_edge_index, cand_pairs_uv=cand_t, h0=h0)
+    else:
+        raise ValueError(f"Unsupported edge_bundle.variant={edge_bundle.variant!r}")
+
     probs = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
 
     n_nodes = int(coords01.shape[0])

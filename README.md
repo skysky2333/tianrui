@@ -83,8 +83,22 @@ Latest top-level artifacts are also copied into `runs/surrogate/` (see `runs/sur
 conda run -n tianrui python -m tessgen.cli.train_edge \
   --epochs 32 \
   --out_dir runs/edge \
-  --device cpu
+  --device cpu \
+  --cand_mode delaunay \
+  --cycle_surrogate_ckpt runs/surrogate/surrogate.pt
 ```
+
+tessgen supports different **candidate edge sets** via `--cand_mode`:
+- `knn` (default): local kNN candidates (uses `--k`)
+- `delaunay`: 2D Delaunay triangulation candidates (`--k` ignored; can miss true edges on some graphs)
+
+tuning candidates (to find a `k` that covers all true edges in your dataset):
+```bash
+conda run -n tianrui python -m tessgen.cli.analyze_edge_candidates \
+  --tess_root data/Tessellation_Dataset \
+  --out_dir out/candidate_analysis
+```
+
 
 Outputs in `runs/edge/<timestamp>/` (full run):
 - `edge_model.pt` (inference artifact)
@@ -94,6 +108,21 @@ Outputs in `runs/edge/<timestamp>/` (full run):
 - `preview_val/epoch_###/` (optional per-epoch qualitative previews; disable with `--no-preview_each_epoch`)
 
 Latest top-level artifacts are also copied into `runs/edge/` (see `runs/edge/latest_run.json`).
+
+3b) Train an `edge_3` model (IDGL-lite; learned kNN message graph):
+
+This variant keeps the same candidate-set idea (`--cand_mode` + `--k`), but uses a **learned embedding-space kNN**
+(`--k_msg`) for message passing.
+
+```bash
+conda run -n tianrui python -m tessgen.cli.train_edge_3 \
+  --epochs 8 \
+  --out_dir runs/edge_3 \
+  --device cpu \
+  --cand_mode delaunay
+
+```
+
 
 4) Train an N prior (RD + metrics → log(N)):
 
@@ -133,7 +162,7 @@ end of **every epoch** and `best.ckpt` is selected by `val/cycle_r_best`:
 conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
   --data_csv data/Data_2.csv \
   --cond_cols RS \
-  --epochs 16 \
+  --epochs 32 \
   --out_dir runs/node_diffusion \
   --device cpu \
   --cycle_surrogate_ckpt runs/surrogate/surrogate.pt \
@@ -141,7 +170,8 @@ conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
   --cycle_k_best 8 \
   --cycle_edge_thr 0.5 \
   --cycle_epoch_rows 10 \
-  --report_max_samples 50
+  --report_max_samples 20 \
+  --cycle_k_best 16
 ```
 
 To disable the per-epoch validation cycle eval (and monitor `val/loss` instead), add `--no-cycle_each_epoch`.
@@ -253,7 +283,17 @@ Edge model:
 
 ```bash
 conda run -n tianrui python -m tessgen.cli.tune_edge \
-  --out_dir runs/tune_edge
+  --out_dir runs/tune_edge \
+  --device cpu \
+  --n_trials 50
+```
+
+```bash
+conda run -n tianrui python -m tessgen.cli.tune_edge_3 \
+  --n_trials 50 \
+  --max_epochs 1 \
+  --out_dir runs/tune_edge_3 \
+  --device cpu
 ```
 
 Node diffusion:

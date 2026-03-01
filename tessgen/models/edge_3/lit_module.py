@@ -8,37 +8,38 @@ import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 
-from .core import EdgeModel, EdgeModelConfig, label_candidate_pairs
-from ...graph_utils import candidate_pairs, pairs_to_edge_index
+from .core import Edge3Model, Edge3ModelConfig, label_candidate_pairs
+from ...graph_utils import candidate_pairs, knn_candidate_pairs, pairs_to_edge_index
 
 
-class EdgeLitModule(pl.LightningModule):
+class Edge3LitModule(pl.LightningModule):
     def __init__(
         self,
         *,
         cfg: dict[str, Any],
         k: int,
         cand_mode: str,
+        k_msg: int,
         neg_ratio: float,
         lr: float,
         weight_decay: float = 1e-2,
     ):
         super().__init__()
         self.save_hyperparameters()
-        cfg_obj = EdgeModelConfig(**cfg)
-        self.model = EdgeModel(cfg=cfg_obj)
+        cfg_obj = Edge3ModelConfig(**cfg)
+        self.model = Edge3Model(cfg=cfg_obj)
         self.k = int(k)
         self.cand_mode = str(cand_mode)
+        self.k_msg = int(k_msg)
         self.neg_ratio = float(neg_ratio)
         self.lr = float(lr)
         self.weight_decay = float(weight_decay)
 
     @property
-    def cfg(self) -> EdgeModelConfig:
+    def cfg(self) -> Edge3ModelConfig:
         return self.model.cfg
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):  # type: ignore[override]
-        # Keep the raw graph sample on CPU; we explicitly move tensors we need.
         return batch
 
     def _graph_loss(self, sample: dict, *, neg_subsample: bool) -> torch.Tensor:
@@ -74,8 +75,12 @@ class EdgeLitModule(pl.LightningModule):
         cand_t = torch.from_numpy(cand_sel).to(device=self.device, dtype=torch.long)
         y_t = torch.from_numpy(y_sel).to(device=self.device, dtype=torch.float32)
 
-        msg_edge_index = pairs_to_edge_index(cand).to(self.device)
-        logits = self.model(coords01=coords01, msg_edge_index=msg_edge_index, cand_pairs_uv=cand_t)
+        h0 = self.model.node_in(coords01)
+        s = self.model.search_proj(h0)
+        msg_pairs = knn_candidate_pairs(s.detach().cpu().numpy(), k=int(self.k_msg))
+        msg_edge_index = pairs_to_edge_index(msg_pairs).to(self.device)
+
+        logits = self.model(coords01=coords01, msg_edge_index=msg_edge_index, cand_pairs_uv=cand_t, h0=h0)
         loss = F.binary_cross_entropy_with_logits(logits, y_t)
         return loss
 
@@ -99,15 +104,17 @@ class EdgeLitModule(pl.LightningModule):
         return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
 
-def export_edge_pt(*, lit: EdgeLitModule, out_path: str, val_bce: float | None = None) -> None:
+def export_edge3_pt(*, lit: Edge3LitModule, out_path: str, val_bce: float | None = None) -> None:
     torch.save(
         {
             "model_state": lit.model.state_dict(),
             "cfg": asdict(lit.cfg),
             "k": int(lit.k),
             "cand_mode": str(lit.cand_mode),
-            "variant": "edge",
+            "k_msg": int(lit.k_msg),
+            "variant": "edge_3",
             "val_bce": float(val_bce) if val_bce is not None else None,
         },
         out_path,
     )
+

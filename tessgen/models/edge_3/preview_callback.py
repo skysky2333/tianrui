@@ -13,16 +13,12 @@ from ...data import GraphStore
 from ...generation import sample_edges_from_coords
 from ...reporting import write_json, write_jsonl
 from ...viz import save_graph_figure
-from .lit_module import EdgeLitModule
+from .lit_module import Edge3LitModule
 
 
-class EdgePreviewEveryEpochCallback(pl.Callback):
+class Edge3PreviewEveryEpochCallback(pl.Callback):
     """
-    Save qualitative edge-model examples at the end of every validation epoch.
-
-    For a fixed subset of validation graph_ids, renders:
-      - true graph (coords + true edges)
-      - predicted graph (same coords + sampled edges from edge model)
+    Save qualitative edge_3 examples at the end of every validation epoch.
 
     Outputs under: out_dir_base/epoch_###/
     """
@@ -65,8 +61,8 @@ class EdgePreviewEveryEpochCallback(pl.Callback):
             return
         if hasattr(trainer, "is_global_zero") and not trainer.is_global_zero:
             return
-        if not isinstance(pl_module, EdgeLitModule):
-            raise TypeError("EdgePreviewEveryEpochCallback requires EdgeLitModule")
+        if not isinstance(pl_module, Edge3LitModule):
+            raise TypeError("Edge3PreviewEveryEpochCallback requires Edge3LitModule")
 
         epoch = int(trainer.current_epoch) + 1
         out_dir = Path(self.out_dir_base) / f"epoch_{epoch:03d}"
@@ -92,10 +88,10 @@ class EdgePreviewEveryEpochCallback(pl.Callback):
 
             edge_bundle = EdgeBundle(
                 model=pl_module.model,
-                variant="edge",
+                variant="edge_3",
                 cand_mode=str(pl_module.cand_mode),
                 k=int(pl_module.k),
-                k_msg=None,
+                k_msg=int(pl_module.k_msg),
             )
             edges_pred = sample_edges_from_coords(
                 edge_bundle=edge_bundle,
@@ -158,7 +154,7 @@ class EdgePreviewEveryEpochCallback(pl.Callback):
         write_jsonl(str(rows_path), rows)
 
         summary = {
-            "task": "edge_preview",
+            "task": "edge_3_preview",
             "epoch": int(epoch),
             "tess_root": self.tess_root,
             "graphs": {"n": int(len(rows)), "graph_ids": [int(x) for x in self.preview_graph_ids]},
@@ -166,6 +162,7 @@ class EdgePreviewEveryEpochCallback(pl.Callback):
                 "edge_thr": float(self.edge_thr),
                 "deg_cap": int(self.deg_cap),
                 "k": int(pl_module.k),
+                "k_msg": int(pl_module.k_msg),
                 "cand_mode": str(pl_module.cand_mode),
             },
             "stats": {
@@ -209,7 +206,6 @@ class EdgePreviewEveryEpochCallback(pl.Callback):
             batch_size=1,
         )
 
-        # Convenience: also dump a compact JSON line for quick grepping.
         with open(str(Path(self.out_dir_base) / "preview_history.jsonl"), "a") as f:
             f.write(
                 json.dumps(
@@ -217,6 +213,9 @@ class EdgePreviewEveryEpochCallback(pl.Callback):
                         "epoch": int(epoch),
                         "edge_thr": float(self.edge_thr),
                         "deg_cap": int(self.deg_cap),
+                        "k": int(pl_module.k),
+                        "k_msg": int(pl_module.k_msg),
+                        "cand_mode": str(pl_module.cand_mode),
                         "val/preview_mean_deg_true": float(summary["stats"]["mean_deg_true"]["mean"]),
                         "val/preview_mean_deg_pred": float(summary["stats"]["mean_deg_pred"]["mean"]),
                         "val/preview_edge_ratio_mean": float(summary["stats"]["edge_ratio"]["mean"]),

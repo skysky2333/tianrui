@@ -229,9 +229,8 @@ def run_cycle_eval(
                     )
                     t_edge0 = time.perf_counter()
                     edges_uv = sample_edges_from_coords(
-                        edge_model=edge_bundle.model,
+                        edge_bundle=edge_bundle,
                         coords01=coords01,
-                        k=edge_bundle.k,
                         deg_cap=int(deg_cap),
                         edge_thr=float(edge_thr),
                         ensure_connected=True,

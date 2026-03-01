@@ -5,7 +5,6 @@ import json
 import sys
 import time
 from dataclasses import asdict
-from pathlib import Path
 
 import pandas as pd
 import pytorch_lightning as pl
@@ -13,22 +12,22 @@ import torch
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader
 
-from .core import EdgeModelConfig
-from .dataset import EdgeGraphDataset
-from .lit_module import EdgeLitModule, export_edge_pt
-from .preview_callback import EdgePreviewEveryEpochCallback
-from .surrogate_rs_callback import SurrogateRSEveryEpochCallback
-from .report import eval_edge_model, make_report_and_figures
+from .core import Edge3ModelConfig
+from .lit_module import Edge3LitModule, export_edge3_pt
+from .preview_callback import Edge3PreviewEveryEpochCallback
+from .report import eval_edge3_model, make_report_and_figures
+from ..edge.dataset import EdgeGraphDataset
+from ..edge.surrogate_rs_callback import SurrogateRSEveryEpochCallback
 from ...ckpt import load_surrogate
 from ...data import collate_first, discover_graph_ids, rows_for_graph_ids, train_val_test_split_graph_ids
+from ...outdirs import finalize_out_dir, make_timestamped_run_dir
 from ...pl_callbacks import EmptyCacheCallback, JsonlMetricsCallback
 from ...pl_utils import lightning_device_from_arg
-from ...outdirs import finalize_out_dir, make_timestamped_run_dir
 from ...utils import device_from_arg, set_seed
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train edge model (Lightning): coords -> edges over kNN candidates")
+    p = argparse.ArgumentParser(description="Train edge_3 model (Lightning): coords -> edges with learned message graph")
     p.add_argument("--tess_root", type=str, default="data/Tessellation_Dataset")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -40,8 +39,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--out_dir", type=str, required=True)
     p.add_argument("--num_workers", type=int, default=4)
 
-    p.add_argument("--k", type=int, default=48)
+    p.add_argument("--k", type=int, default=39, help="Candidate k (used when cand_mode=knn)")
     p.add_argument("--cand_mode", type=str, default="knn", help="Candidate set construction: knn|delaunay")
+    p.add_argument("--k_msg", type=int, default=12, help="kNN for message graph in learned embedding space")
     p.add_argument("--neg_ratio", type=float, default=3.0)
     p.add_argument("--thr", type=float, default=0.5, help="Threshold for P(edge) in report metrics")
     p.add_argument("--max_pairs_report", type=int, default=2_000_000, help="Max candidate pairs to evaluate for curves")
@@ -61,6 +61,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--d_h", type=int, default=128)
     p.add_argument("--n_layers", type=int, default=3)
     p.add_argument("--n_rbf", type=int, default=16)
+    p.add_argument("--d_search", type=int, default=16)
     p.add_argument("--dropout", type=float, default=0.0)
 
     p.add_argument("--limit_train_batches", type=float, default=1.0)
@@ -80,6 +81,10 @@ def main() -> None:
         raise SystemExit(f"--preview_edge_thr must be in [0,1]; got {args.preview_edge_thr}")
     if str(args.cand_mode) not in ("knn", "delaunay"):
         raise SystemExit(f"--cand_mode must be 'knn' or 'delaunay'; got {args.cand_mode!r}")
+    if int(args.k_msg) <= 0:
+        raise SystemExit(f"--k_msg must be > 0; got {args.k_msg}")
+    if int(args.d_search) <= 0:
+        raise SystemExit(f"--d_search must be > 0; got {args.d_search}")
 
     dev = lightning_device_from_arg(args.device)
     num_workers = int(args.num_workers)
@@ -98,11 +103,18 @@ def main() -> None:
     dl_val = DataLoader(ds_val, batch_size=1, shuffle=False, collate_fn=collate_first, **dl_kwargs)
     dl_test = DataLoader(ds_test, batch_size=1, shuffle=False, collate_fn=collate_first, **dl_kwargs)
 
-    cfg = EdgeModelConfig(d_h=int(args.d_h), n_layers=int(args.n_layers), n_rbf=int(args.n_rbf), dropout=float(args.dropout))
-    lit = EdgeLitModule(
+    cfg = Edge3ModelConfig(
+        d_h=int(args.d_h),
+        n_layers=int(args.n_layers),
+        n_rbf=int(args.n_rbf),
+        d_search=int(args.d_search),
+        dropout=float(args.dropout),
+    )
+    lit = Edge3LitModule(
         cfg=asdict(cfg),
         k=int(args.k),
         cand_mode=str(args.cand_mode),
+        k_msg=int(args.k_msg),
         neg_ratio=float(args.neg_ratio),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
@@ -119,7 +131,7 @@ def main() -> None:
     history_path = str(run_dir / "history.jsonl")
     preview_cb = None
     if bool(args.preview_each_epoch):
-        preview_cb = EdgePreviewEveryEpochCallback(
+        preview_cb = Edge3PreviewEveryEpochCallback(
             tess_root=str(args.tess_root),
             graph_ids=val_g,
             out_dir_base=str(run_dir / "preview_val"),
@@ -180,19 +192,18 @@ def main() -> None:
     best_path = ckpt_cb.best_model_path
     if not best_path:
         raise RuntimeError("No best checkpoint was saved. Ensure validation ran and ModelCheckpoint is monitoring a metric.")
-    best_lit = EdgeLitModule.load_from_checkpoint(best_path)
+    best_lit = Edge3LitModule.load_from_checkpoint(best_path)
     trainer.test(best_lit, dataloaders=dl_test, verbose=False)
 
     if ckpt_cb.best_model_score is None:
         raise RuntimeError("No best_model_score found on ModelCheckpoint callback.")
-    export_edge_pt(
+    export_edge3_pt(
         lit=best_lit,
         out_path=str(run_dir / "edge_model.pt"),
         val_bce=float(ckpt_cb.best_model_score),
     )
 
-    # Comprehensive test report + figures
-    test_eval = eval_edge_model(
+    test_eval = eval_edge3_model(
         lit=best_lit.to(torch_device),
         dl=dl_test,
         thr=float(args.thr),
@@ -201,12 +212,13 @@ def main() -> None:
     make_report_and_figures(run_dir=str(run_dir), history_path=history_path, test_eval=test_eval)
 
     config = {
-        "task": "edge_model",
+        "task": "edge_3_model",
         "tess_root": args.tess_root,
         "model_cfg": asdict(cfg),
         "train": {"epochs": int(args.epochs), "lr": float(args.lr), "weight_decay": float(args.weight_decay)},
         "k": int(args.k),
         "cand_mode": str(args.cand_mode),
+        "k_msg": int(args.k_msg),
         "neg_ratio": float(args.neg_ratio),
         "thr": float(args.thr),
         "preview": {
