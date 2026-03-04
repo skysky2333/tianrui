@@ -8,6 +8,7 @@ import torch
 from .lit_module import NodeDiffusionLitModule
 from ...graph_utils import knn_candidate_pairs, pairs_to_edge_index
 from ...reporting import read_jsonl, save_bar_plot_both, save_line_plot, write_json
+from ...transforms import coord01_to_diffusion_space_torch
 
 
 def _safe_mean(xs: list[float]) -> float:
@@ -30,6 +31,11 @@ def eval_node_diffusion(
         if max_samples and i >= int(max_samples):
             break
         coords0_cpu = sample["coords01"]
+        coords0_cpu = coord01_to_diffusion_space_torch(
+            coords0_cpu,
+            coord_space=str(getattr(lit, "coord_space", "unit")),
+            coord_eps=float(getattr(lit, "coord_eps", 1e-4)),
+        )
         N = int(coords0_cpu.shape[0])
         cond_z = lit._cond_to_z(sample)  # noqa: SLF001
 

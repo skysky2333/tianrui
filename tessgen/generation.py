@@ -14,6 +14,7 @@ from .graph_utils import (
     pairs_to_edge_index,
 )
 from .node_diffusion import DiffusionSchedule, NodeDenoiser
+from .transforms import diffusion_space_to_coord01_torch
 
 
 @torch.no_grad()
@@ -24,12 +25,18 @@ def ddpm_sample_coords(
     cond_z: torch.Tensor,
     n_nodes: int,
     k_nn: int,
+    coord_space: str = "unit",
+    coord_eps: float = 1e-4,
     device: torch.device,
 ) -> torch.Tensor:
     """
     Returns coords01 in (N,2) roughly in [0,1].
     """
-    x = torch.randn((n_nodes, 2), device=device, dtype=torch.float32)
+    mode = str(coord_space)
+    if mode not in {"unit", "logit"}:
+        raise ValueError(f"Unsupported coord_space={coord_space!r} (expected 'unit'|'logit')")
+
+    x = torch.randn((n_nodes, 2), device=device, dtype=torch.float32)  # diffusion-space coords
     T = schedule.n_steps
     for t_int in reversed(range(T)):
         t = torch.tensor([t_int], device=device, dtype=torch.long)
@@ -50,7 +57,10 @@ def ddpm_sample_coords(
         else:
             x = mean
 
-    return x.clamp(0.0, 1.0)
+    if mode == "unit":
+        return x.clamp(0.0, 1.0)
+    # logit-space diffusion: map back smoothly without hard clamping-induced boundary pileups.
+    return diffusion_space_to_coord01_torch(x, coord_space="logit", coord_eps=float(coord_eps))
 
 
 @torch.no_grad()

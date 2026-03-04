@@ -152,6 +152,8 @@ conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
   --cond_cols RS \
   --epochs 16 \
   --no-use_rd \
+  --coord_space logit \
+  --coord_eps 1e-4 \
   --out_dir runs/node_diffusion \
   --device cpu
 ```
@@ -164,8 +166,9 @@ end of **every epoch** and `best.ckpt` is selected by `val/cycle_r_best`:
 conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
   --data_csv data/Data_2.csv \
   --cond_cols RS \
-  --epochs 16 \
+  --epochs 32 \
   --no-use_rd \
+  --coord_space logit \
   --out_dir runs/node_diffusion \
   --device cpu \
   --cycle_surrogate_ckpt runs/surrogate/surrogate.pt \

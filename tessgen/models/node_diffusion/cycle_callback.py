@@ -26,6 +26,8 @@ def node_bundle_from_lit(*, lit: NodeDiffusionLitModule) -> NodeDiffusionBundle:
         log_cols=set(lit.log_cols),
         cond_scaler=cond_scaler,
         use_rd=bool(lit.use_rd),
+        coord_space=str(getattr(lit, "coord_space", "unit")),
+        coord_eps=float(getattr(lit, "coord_eps", 1e-4)),
         k_nn=int(lit.k_nn),
     )
 

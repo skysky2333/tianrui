@@ -94,6 +94,8 @@ class NodeDiffusionBundle:
     log_cols: set[str]
     cond_scaler: StandardScaler
     use_rd: bool
+    coord_space: str
+    coord_eps: float
     k_nn: int
 
 
@@ -108,6 +110,12 @@ def load_node_diffusion(ckpt_path: str, *, device: torch.device) -> NodeDiffusio
     cond_cols = list(ckpt["cond_cols"])
     log_cols = set(ckpt["log_cols"])
     use_rd = bool(ckpt.get("use_rd", True))
+    coord_space = str(ckpt.get("coord_space", "unit"))
+    if coord_space not in {"unit", "logit"}:
+        raise ValueError(f"Unsupported coord_space={coord_space!r} in checkpoint (expected 'unit'|'logit')")
+    coord_eps = float(ckpt.get("coord_eps", 1e-4))
+    if not (0.0 < coord_eps < 0.5):
+        raise ValueError(f"Invalid coord_eps={coord_eps} in checkpoint (expected 0 < eps < 0.5)")
     cond_scaler = StandardScaler(
         mean=np.array(ckpt["cond_scaler_mean"], dtype=np.float32),
         std=np.array(ckpt["cond_scaler_std"], dtype=np.float32),
@@ -120,5 +128,7 @@ def load_node_diffusion(ckpt_path: str, *, device: torch.device) -> NodeDiffusio
         log_cols=log_cols,
         cond_scaler=cond_scaler,
         use_rd=use_rd,
+        coord_space=coord_space,
+        coord_eps=coord_eps,
         k_nn=k_nn,
     )

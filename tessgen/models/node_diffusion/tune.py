@@ -38,6 +38,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--cond_cols", type=str, nargs="+", required=True)
     p.add_argument("--log_cols", type=str, nargs="*", default=["RS"])
     p.add_argument("--use_rd", action=argparse.BooleanOptionalAction, default=True, help="Include RD as an input feature")
+    p.add_argument("--coord_space", type=str, default="unit", help="Coordinate diffusion space: unit|logit")
+    p.add_argument("--coord_eps", type=float, default=1e-4, help="Epsilon for coord_space=logit (clamp to [eps,1-eps])")
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="auto")
@@ -113,6 +115,12 @@ def main() -> None:
     cond_cols = list(args.cond_cols)
     log_cols = set(args.log_cols or [])
     use_rd = bool(args.use_rd)
+    coord_space = str(args.coord_space)
+    if coord_space not in {"unit", "logit"}:
+        raise SystemExit(f"--coord_space must be 'unit' or 'logit'; got {coord_space!r}")
+    coord_eps = float(args.coord_eps)
+    if not (0.0 < coord_eps < 0.5):
+        raise SystemExit(f"--coord_eps must be in (0,0.5); got {coord_eps}")
 
     graph_ids = discover_graph_ids(args.tess_root)
     train_g, val_g = train_val_split_graph_ids(graph_ids, val_frac=float(args.val_frac), seed=int(args.seed))
@@ -212,6 +220,8 @@ def main() -> None:
             cond_scaler_mean=cond_scaler.mean.tolist(),
             cond_scaler_std=cond_scaler.std.tolist(),
             use_rd=use_rd,
+            coord_space=coord_space,
+            coord_eps=float(coord_eps),
             k_nn=k_nn,
             lr=float(lr),
             weight_decay=float(wd),
@@ -263,6 +273,8 @@ def main() -> None:
         "cond_cols": cond_cols,
         "log_cols": sorted(log_cols),
         "use_rd": bool(use_rd),
+        "coord_space": str(coord_space),
+        "coord_eps": float(coord_eps),
         "val_frac": float(args.val_frac),
         "device": {"accelerator": dev.accelerator, "devices": dev.devices},
         "search_space": {"k_nn": k_nn_choices, "steps": steps_choices, "beta_start": beta_start_spec, "beta_end": beta_end_spec},

@@ -297,6 +297,8 @@ def run_cycle_eval(
                         cond_z=cond_z,
                         n_nodes=n_nodes,
                         k_nn=node_bundle.k_nn,
+                        coord_space=str(getattr(node_bundle, "coord_space", "unit")),
+                        coord_eps=float(getattr(node_bundle, "coord_eps", 1e-4)),
                         device=device,
                     )
                     t_ddpm = float(time.perf_counter() - t_ddpm0)

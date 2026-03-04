@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from .core import DiffusionConfig, DiffusionSchedule, NodeDenoiser, NodeDenoiserConfig
 from ...graph_utils import knn_candidate_pairs, pairs_to_edge_index
-from ...transforms import apply_log_cols_torch
+from ...transforms import apply_log_cols_torch, coord01_to_diffusion_space_torch
 
 
 class NodeDiffusionLitModule(pl.LightningModule):
@@ -24,6 +24,8 @@ class NodeDiffusionLitModule(pl.LightningModule):
         cond_scaler_mean: list[float],
         cond_scaler_std: list[float],
         use_rd: bool = True,
+        coord_space: str = "unit",
+        coord_eps: float = 1e-4,
         k_nn: int,
         lr: float,
         weight_decay: float = 1e-2,
@@ -40,6 +42,12 @@ class NodeDiffusionLitModule(pl.LightningModule):
         self.cond_cols = list(cond_cols)
         self.log_cols = set(log_cols)
         self.use_rd = bool(use_rd)
+        self.coord_space = str(coord_space)
+        if self.coord_space not in {"unit", "logit"}:
+            raise ValueError(f"Unsupported coord_space={self.coord_space!r} (expected 'unit'|'logit')")
+        self.coord_eps = float(coord_eps)
+        if not (0.0 < float(self.coord_eps) < 0.5):
+            raise ValueError(f"coord_eps must be in (0,0.5); got {self.coord_eps}")
         self.k_nn = int(k_nn)
         self.lr = float(lr)
         self.weight_decay = float(weight_decay)
@@ -69,9 +77,14 @@ class NodeDiffusionLitModule(pl.LightningModule):
         return ((full - self.cond_scaler_mean) / self.cond_scaler_std).squeeze(0)
 
     def _step(self, sample: dict, stage: str) -> torch.Tensor:
-        coords0_cpu = sample["coords01"]  # (N,2) on CPU
+        coords0_cpu = sample["coords01"]  # (N,2) coords01 on CPU
         if coords0_cpu.device.type != "cpu":
             raise RuntimeError(f"Expected coords01 on CPU, got {coords0_cpu.device}")
+        coords0_cpu = coord01_to_diffusion_space_torch(
+            coords0_cpu,
+            coord_space=str(self.coord_space),
+            coord_eps=float(self.coord_eps),
+        )
         N = int(coords0_cpu.shape[0])
         cond_z = self._cond_to_z(sample)
 
@@ -122,6 +135,8 @@ def export_node_diffusion_pt(
             "cond_cols": lit.cond_cols,
             "log_cols": sorted(lit.log_cols),
             "use_rd": bool(lit.use_rd),
+            "coord_space": str(lit.coord_space),
+            "coord_eps": float(lit.coord_eps),
             "cond_scaler_mean": lit.cond_scaler_mean.detach().cpu().tolist(),
             "cond_scaler_std": lit.cond_scaler_std.detach().cpu().tolist(),
             "k_nn": int(lit.k_nn),

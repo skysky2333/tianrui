@@ -43,6 +43,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--cond_cols", type=str, nargs="+", required=True)
     p.add_argument("--log_cols", type=str, nargs="*", default=["RS"])
     p.add_argument("--use_rd", action=argparse.BooleanOptionalAction, default=True, help="Include RD as an input feature")
+    p.add_argument("--coord_space", type=str, default="unit", help="Coordinate diffusion space: unit|logit")
+    p.add_argument("--coord_eps", type=float, default=1e-4, help="Epsilon for coord_space=logit (clamp to [eps,1-eps])")
 
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -145,6 +147,12 @@ def main() -> None:
     cond_cols = list(args.cond_cols)
     log_cols = set(args.log_cols or [])
     use_rd = bool(args.use_rd)
+    coord_space = str(args.coord_space)
+    if coord_space not in {"unit", "logit"}:
+        raise SystemExit(f"--coord_space must be 'unit' or 'logit'; got {coord_space!r}")
+    coord_eps = float(args.coord_eps)
+    if not (0.0 < coord_eps < 0.5):
+        raise SystemExit(f"--coord_eps must be in (0,0.5); got {coord_eps}")
 
     dev = lightning_device_from_arg(args.device)
     num_workers = int(args.num_workers)
@@ -215,6 +223,8 @@ def main() -> None:
         cond_scaler_mean=cond_scaler.mean.tolist(),
         cond_scaler_std=cond_scaler.std.tolist(),
         use_rd=use_rd,
+        coord_space=coord_space,
+        coord_eps=float(coord_eps),
         k_nn=int(args.k_nn),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
@@ -381,6 +391,8 @@ def main() -> None:
         "cond_cols": cond_cols,
         "log_cols": sorted(log_cols),
         "use_rd": bool(use_rd),
+        "coord_space": str(coord_space),
+        "coord_eps": float(coord_eps),
         "denoiser_cfg": asdict(den_cfg),
         "schedule_cfg": asdict(schedule_cfg),
         "train": {"epochs": int(args.epochs), "lr": float(args.lr), "weight_decay": float(args.weight_decay)},
