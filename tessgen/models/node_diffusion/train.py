@@ -338,9 +338,25 @@ def main() -> None:
     device = torch_device
     best_lit = best_lit.to(device)
     test_eval = eval_node_diffusion(lit=best_lit, dl=dl_test, max_samples=int(args.report_max_samples))
+    cycle_rows_used = None
     cycle_eval = None
     if cycle_enabled:
-        cycle_rows = test_rows if int(args.cycle_max_rows) == 0 else test_rows[: int(args.cycle_max_rows)]
+        max_cycle_rows = int(args.cycle_max_rows)
+        if max_cycle_rows <= 0:
+            max_cycle_rows = 0
+        max_report_samples = int(args.report_max_samples)
+        if max_report_samples <= 0:
+            max_report_samples = 0
+
+        max_rows_eff = 0
+        if max_cycle_rows and max_report_samples:
+            max_rows_eff = min(max_cycle_rows, max_report_samples)
+        elif max_cycle_rows:
+            max_rows_eff = max_cycle_rows
+        elif max_report_samples:
+            max_rows_eff = max_report_samples
+
+        cycle_rows_used = test_rows if max_rows_eff == 0 else test_rows[: int(max_rows_eff)]
         if cycle_cb is None:
             surrogate = load_surrogate(str(args.cycle_surrogate_ckpt), device=device)
             edge_bundle = load_edge_model(str(args.cycle_edge_ckpt), device=device)
@@ -356,7 +372,7 @@ def main() -> None:
         node_bundle = node_bundle_from_lit(lit=best_lit)
         cycle_eval = run_cycle_eval(
             df=df,
-            row_indices=[int(x) for x in cycle_rows],
+            row_indices=[int(x) for x in (cycle_rows_used or [])],
             tess_root=args.tess_root,
             surrogate=surrogate,
             node_bundle=node_bundle,
@@ -397,6 +413,7 @@ def main() -> None:
         "schedule_cfg": asdict(schedule_cfg),
         "train": {"epochs": int(args.epochs), "lr": float(args.lr), "weight_decay": float(args.weight_decay)},
         "k_nn": int(args.k_nn),
+        "report_max_samples": int(args.report_max_samples),
         "cycle_eval": {
             "enabled": bool(str(args.cycle_surrogate_ckpt) or str(args.cycle_edge_ckpt)),
             "surrogate_ckpt": str(args.cycle_surrogate_ckpt) if str(args.cycle_surrogate_ckpt) else None,
@@ -417,6 +434,7 @@ def main() -> None:
             "n_prior_ckpt": str(args.cycle_n_prior_ckpt) if str(args.cycle_n_prior_ckpt) else None,
             "n_prior_samples": int(args.cycle_n_prior_samples),
             "max_rows": int(args.cycle_max_rows),
+            "max_rows_effective": int(len(cycle_rows_used)) if cycle_rows_used is not None else None,
             "each_epoch": bool(cycle_each_epoch),
             "epoch_rows": int(args.cycle_epoch_rows),
             "epoch_save_row_figs": bool(args.cycle_epoch_save_row_figs),

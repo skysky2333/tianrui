@@ -147,8 +147,12 @@ def save_graph_figure(
     n_edges = int(edges_uv.shape[0])
     ax.text(0.01, 0.01, f"N={n_nodes}  E={n_edges}", transform=ax.transAxes, fontsize=10, ha="left", va="bottom")
 
+    title_s = None
+    title_lines = 0
     if title is not None:
-        ax.set_title(str(title))
+        title_s = str(title)
+        title_lines = title_s.count("\n") + 1
+        ax.set_title(title_s, fontsize=10)
 
     if hide_axes:
         ax.set_xticks([])
@@ -156,7 +160,12 @@ def save_graph_figure(
         for s in ax.spines.values():
             s.set_visible(False)
 
-    fig.tight_layout()
+    if title_lines <= 1:
+        fig.tight_layout()
+    else:
+        # Leave extra top margin for multi-line titles; otherwise tight_layout may clip.
+        rect_top = max(0.78, 0.98 - 0.04 * float(title_lines - 1))
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, float(rect_top)))
     if out_png:
         fig.savefig(out_png, dpi=int(dpi))
     if out_svg:

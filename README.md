@@ -182,6 +182,11 @@ conda run -n tianrui python -m tessgen.cli.train_node_diffusion \
 
 To disable the per-epoch validation cycle eval (and monitor `val/loss` instead), add `--no-cycle_each_epoch`.
 
+Notes:
+- `--report_max_samples` caps how many **test rows** are evaluated in the end-of-training diffusion report, and also caps the
+  end-of-training **test** cycle eval rows (when enabled) to keep the report quick.
+- Use `--cycle_max_rows` to independently cap the final test cycle eval rows; if both are set, the smaller limit is used.
+
 Outputs in `runs/node_diffusion/<timestamp>/` (full run):
 - `node_diffusion.pt` (inference artifact)
 - `best.ckpt` / `last.ckpt` (Lightning checkpoints)

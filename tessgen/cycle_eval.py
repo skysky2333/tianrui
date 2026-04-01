@@ -100,6 +100,7 @@ def run_cycle_eval(
       - rows.jsonl (per-row details)
       - figures/ (summary plots, PNG+SVG)
       - graphs_true/, graphs_single/, graphs_best/ (per-row plots, PNG+SVG) if save_row_figs
+      - graphs_tried/ (all best-of-k tries per row, PNG+SVG) if save_row_figs
     """
     out = Path(out_dir)
     ensure_dir(str(out))
@@ -144,6 +145,7 @@ def run_cycle_eval(
     graphs_true_dir = out / "graphs_true"
     graphs_single_dir = out / "graphs_single"
     graphs_best_dir = out / "graphs_best"
+    graphs_tried_dir = out / "graphs_tried"
 
     y_true_all: list[np.ndarray] = []
     y_truegraph_all: list[np.ndarray] = []
@@ -275,6 +277,8 @@ def run_cycle_eval(
 
                 single = None
                 best = None
+                best_j = None
+                tried: list[dict] = []
                 for j in range(k_best):
                     n_nodes = int(n_values[j % len(n_values)])
                     logn_t = torch.tensor([[float(np.log(float(n_nodes)))]], device=device, dtype=torch.float32)
@@ -370,6 +374,7 @@ def run_cycle_eval(
                     t_sur = float(time.perf_counter() - t_sur0)
 
                     cand = {
+                        "j": int(j),
                         "err_mse_z": float(err),
                         "rd_solved": float(rd_solved) if rd_solved is not None else None,
                         "rd_hit_bound": bool(rd_hit_bound) if rd_hit_bound is not None else None,
@@ -379,12 +384,15 @@ def run_cycle_eval(
                         "edges_uv": edges_uv,
                         "pred_vec": pred_vec,
                     }
+                    tried.append(cand)
                     if j == 0:
                         single = cand
                         best = cand
+                        best_j = int(j)
                     else:
                         if cand["err_mse_z"] < float(best["err_mse_z"]):  # type: ignore[index]
                             best = cand
+                            best_j = int(j)
 
                     best_err = float(best["err_mse_z"]) if best is not None else float("nan")
                     pbar.set_postfix_str(
@@ -398,6 +406,8 @@ def run_cycle_eval(
 
                 if single is None or best is None:
                     raise RuntimeError("No candidates were generated")
+                if best_j is None:
+                    raise RuntimeError("Internal error: best_j is None")
 
                 true_pred = {c: float(pred_vec_true[i]) for i, c in enumerate(surrogate.target_cols)}
                 single_pred = {c: float(single["pred_vec"][i]) for i, c in enumerate(surrogate.target_cols)}
@@ -432,6 +442,7 @@ def run_cycle_eval(
                         "pred": true_pred,
                     },
                     "single": {
+                        "j": 1,
                         "err_mse_z": float(single["err_mse_z"]),
                         "n_nodes": int(single["n_nodes"]),
                         "n_edges": int(single["n_edges"]),
@@ -442,6 +453,7 @@ def run_cycle_eval(
                     },
                     "best": {
                         "k": int(k_best),
+                        "j": int(best_j) + 1,
                         "err_mse_z": float(best["err_mse_z"]),
                         "n_nodes": int(best["n_nodes"]),
                         "n_edges": int(best["n_edges"]),
@@ -450,6 +462,19 @@ def run_cycle_eval(
                         "rd_hit_bound": best.get("rd_hit_bound"),
                         "pred": best_pred,
                     },
+                    "tried": [
+                        {
+                            "j": int(cand2["j"]) + 1,
+                            "is_best": bool(int(cand2["j"]) == int(best_j)),
+                            "err_mse_z": float(cand2["err_mse_z"]),
+                            "n_nodes": int(cand2["n_nodes"]),
+                            "n_edges": int(cand2["n_edges"]),
+                            "rd_used": float(rd) if rd_mode_s == "fixed" else None,
+                            "rd_solved": cand2.get("rd_solved"),
+                            "rd_hit_bound": cand2.get("rd_hit_bound"),
+                        }
+                        for cand2 in tried
+                    ],
                 }
 
                 if save_row_figs:
@@ -457,6 +482,14 @@ def run_cycle_eval(
                     coords_true = g_true.coords01.detach().cpu().numpy() * COORD_RANGE + COORD_MIN
                     coords_single = single["coords01"] * COORD_RANGE + COORD_MIN
                     coords_best = best["coords01"] * COORD_RANGE + COORD_MIN
+                    rd_true_s = f" rd_solved={float(rd_true_solved):.4g}" if rd_true_solved is not None else ""
+                    rd_true_bound_s = " hit_bound=True" if bool(rd_true_hit_bound) else ""
+                    rd_single_s = (
+                        f" rd_solved={float(single.get('rd_solved')):.4g}" if single.get("rd_solved") is not None else ""
+                    )
+                    rd_single_bound_s = " hit_bound=True" if bool(single.get("rd_hit_bound")) else ""
+                    rd_best_s = f" rd_solved={float(best.get('rd_solved')):.4g}" if best.get("rd_solved") is not None else ""
+                    rd_best_bound_s = " hit_bound=True" if bool(best.get("rd_hit_bound")) else ""
                     true_png = graphs_true_dir / f"graph_row{row_idx}.png"
                     true_svg = graphs_true_dir / f"graph_row{row_idx}.svg"
                     single_png = graphs_single_dir / f"graph_row{row_idx}.png"
@@ -472,6 +505,7 @@ def run_cycle_eval(
                         title=(
                             f"true | row={row_idx} rd={rd:.4g} N={n_nodes_true} E={n_edges_true}\n"
                             f"{rs_col}_true={rs_true:.4g} {rs_col}_pred={rs_truegraph:.4g} err_mse_z={err_true:.3g}"
+                            f"{rd_true_s}{rd_true_bound_s}"
                         ),
                     )
                     save_graph_figure(
@@ -481,7 +515,7 @@ def run_cycle_eval(
                         out_svg=str(single_svg),
                         title=(
                             f"single | row={row_idx} rd={rd:.4g} err_mse_z={single['err_mse_z']:.3g}\n"
-                            f"{rs_col}_true={rs_true:.4g} {rs_col}_pred={rs_single:.4g}"
+                            f"{rs_col}_true={rs_true:.4g} {rs_col}_pred={rs_single:.4g}{rd_single_s}{rd_single_bound_s}"
                         ),
                     )
                     save_graph_figure(
@@ -491,9 +525,49 @@ def run_cycle_eval(
                         out_svg=str(best_svg),
                         title=(
                             f"best | row={row_idx} rd={rd:.4g} err_mse_z={best['err_mse_z']:.3g}\n"
-                            f"{rs_col}_true={rs_true:.4g} {rs_col}_pred={rs_best:.4g}"
+                            f"{rs_col}_true={rs_true:.4g} {rs_col}_pred={rs_best:.4g}{rd_best_s}{rd_best_bound_s}"
                         ),
                     )
+
+                    tried_figs: list[dict[str, object]] = []
+                    for cand2 in tried:
+                        j = int(cand2["j"]) + 1
+                        coords_try = cand2["coords01"] * COORD_RANGE + COORD_MIN
+                        row_try_dir = graphs_tried_dir / f"row{row_idx}"
+                        try_png = row_try_dir / f"try_{j:02d}.png"
+                        try_svg = row_try_dir / f"try_{j:02d}.svg"
+
+                        rs_try = float(cand2["pred_vec"][rs_idx])
+                        rd_solved_try = cand2.get("rd_solved")
+                        rd_hit_bound_try = cand2.get("rd_hit_bound")
+                        rd_solved_s = (
+                            f" rd_solved={float(rd_solved_try):.4g}" if rd_solved_try is not None else ""
+                        )
+                        rd_bound_s = " hit_bound=True" if bool(rd_hit_bound_try) else ""
+                        best_s = " best=True" if int(cand2["j"]) == int(best_j) else ""
+
+                        save_graph_figure(
+                            coords=coords_try,
+                            edges_uv=cand2["edges_uv"],
+                            out_png=str(try_png),
+                            out_svg=str(try_svg),
+                            title=(
+                                f"try {j}/{k_best} | row={row_idx} N={int(cand2['n_nodes'])} E={int(cand2['n_edges'])} "
+                                f"err_mse_z={float(cand2['err_mse_z']):.3g}\n"
+                                f"rd_label={rd:.4g}{rd_solved_s}{rd_bound_s}{best_s}\n"
+                                f"{rs_col}_true={rs_true:.4g} {rs_col}_pred={rs_try:.4g}"
+                            ),
+                        )
+                        tried_figs.append(
+                            {
+                                "j": int(j),
+                                "is_best": bool(int(cand2["j"]) == int(best_j)),
+                                "png": str(try_png),
+                                "svg": str(try_svg),
+                                "rd_solved": rd_solved_try,
+                                "rd_hit_bound": rd_hit_bound_try,
+                            }
+                        )
                     row_record["figures"] = {
                         "true_png": str(true_png),
                         "true_svg": str(true_svg),
@@ -501,6 +575,7 @@ def run_cycle_eval(
                         "single_svg": str(single_svg),
                         "best_png": str(best_png),
                         "best_svg": str(best_svg),
+                        "tried": tried_figs,
                     }
 
                 if save_graph_files:
@@ -607,6 +682,7 @@ def run_cycle_eval(
             artifacts["graphs_true_dir"] = str(graphs_true_dir)
             artifacts["graphs_single_dir"] = str(graphs_single_dir)
             artifacts["graphs_best_dir"] = str(graphs_best_dir)
+            artifacts["graphs_tried_dir"] = str(graphs_tried_dir)
 
         pbar.set_postfix_str("step=complete", refresh=True)
 

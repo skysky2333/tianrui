@@ -27,6 +27,7 @@ def eval_node_diffusion(
     diffs = []
     n_all = []
 
+    n_seen = 0
     for i, sample in enumerate(dl):
         if max_samples and i >= int(max_samples):
             break
@@ -54,9 +55,10 @@ def eval_node_diffusion(
         losses.append(float(loss.detach().cpu()))
         diffs.append(float(diff_loss.detach().cpu()))
         n_all.append(float(N))
+        n_seen += 1
 
     return {
-        "samples": int(min(len(dl), int(max_samples)) if max_samples else len(dl)),
+        "samples": int(n_seen),
         "loss_mean": _safe_mean(losses),
         "diff_mse_mean": _safe_mean(diffs),
         "n_nodes": {
