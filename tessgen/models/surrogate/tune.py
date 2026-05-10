@@ -36,6 +36,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tess_root", type=str, default="data/Tessellation_Dataset")
     p.add_argument("--target_cols", type=str, nargs="+", required=True)
     p.add_argument("--log_cols", type=str, nargs="*", default=["RS"])
+    p.add_argument("--use_rd", action=argparse.BooleanOptionalAction, default=True, help="Include RD as an input feature")
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="auto")
@@ -67,6 +68,7 @@ def main() -> None:
 
     target_cols = list(args.target_cols)
     log_cols = set(args.log_cols or [])
+    use_rd = bool(args.use_rd)
 
     dev = lightning_device_from_arg(args.device)
     num_workers = int(args.num_workers)
@@ -96,6 +98,7 @@ def main() -> None:
             n_layers=trial.suggest_int("n_layers", 2, 6),
             n_rbf=trial.suggest_categorical("n_rbf", [8, 16, 24]),
             dropout=trial.suggest_float("dropout", 0.0, 0.2),
+            use_rd=use_rd,
         )
         lr = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
         wd = trial.suggest_float("weight_decay", 1e-4, 5e-2, log=True)
@@ -157,6 +160,7 @@ def main() -> None:
         "tess_root": args.tess_root,
         "target_cols": target_cols,
         "log_cols": sorted(log_cols),
+        "use_rd": bool(use_rd),
         "val_frac": float(args.val_frac),
         "device": {"accelerator": dev.accelerator, "devices": dev.devices},
         "n_trials": int(args.n_trials),

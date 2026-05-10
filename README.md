@@ -77,6 +77,26 @@ Outputs in `runs/surrogate/<timestamp>/` (full run):
 
 Latest top-level artifacts are also copied into `runs/surrogate/` (see `runs/surrogate/latest_run.json`).
 
+If you want the surrogate to ignore `RD`, add `--no-use_rd`.
+
+If you want one no-`RD` surrogate per fixed `RD` slice, use:
+
+```bash
+conda run -n tianrui python -m tessgen.cli.train_surrogate \
+  --data_csv data/Data_2.csv \
+  --target_cols RS \
+  --epochs 4 \
+  --batch_size 64 \
+  --train_per_rd \
+  --out_dir runs/surrogate_per_rd_cpu \
+  --device cpu
+```
+
+Per-`RD` runs write:
+- `report.json` (top-level aggregate report)
+- `rd_slice_summary.json`, `rd_slice_summary.csv`, `findings.md`
+- `rd_<value>/...` subdirectories with each slice's `surrogate.pt`, checkpoints, figures, and report
+
 3) Train an edge model (coords → edges):
 
 ```bash

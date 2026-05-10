@@ -110,7 +110,7 @@ def make_report_and_figures(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     test_mse_z: float,
-) -> None:
+) -> dict:
     run = Path(run_dir)
     figs = run / "figures"
     figs.mkdir(parents=True, exist_ok=True)
@@ -185,3 +185,4 @@ def make_report_and_figures(
         "figures_dir": str(figs),
     }
     write_json(str(run / "report.json"), report)
+    return report
