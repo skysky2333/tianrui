@@ -284,7 +284,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--diffusion_steps", type=int, default=50)
     p.add_argument("--beta_start", type=float, default=1e-4)
     p.add_argument("--beta_end", type=float, default=2e-2)
-    p.add_argument("--critic_sample_steps", type=int, default=8)
+    p.add_argument("--critic_sample_steps", type=int, default=8, help="Diffusion critic sample steps; set <0 to train diffusion only")
     p.add_argument("--sample_steps", type=int, default=0, help="Diffusion report generation steps; 0 = all diffusion steps")
 
     p.add_argument("--stats_graphs", type=int, default=512, help="Bounded count used to estimate radius scale; 0 = all train graphs")

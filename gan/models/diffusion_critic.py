@@ -66,6 +66,10 @@ class DiffusionCriticLitModule(pl.LightningModule):
     def r_scale(self) -> float:
         return float(self.hparams.r_scale)
 
+    @property
+    def critic_enabled(self) -> bool:
+        return int(self.hparams.critic_sample_steps) >= 0
+
     def _real_logit(self, xyr01: torch.Tensor, edges_uv: torch.Tensor) -> torch.Tensor:
         edge_index, edge_weight = undirected_to_directed(edges_uv)
         return self.critic(xyr01=xyr01, edge_index=edge_index, edge_weight=edge_weight)
@@ -126,9 +130,10 @@ class DiffusionCriticLitModule(pl.LightningModule):
         xyr01 = normalize_xyr(batch["xyr"].to(self.device), r_scale=self.r_scale)
         if bool(self.hparams.learn_edges):
             edges_uv = batch["edges_undirected"].to(self.device)
-        else:
+        elif self.critic_enabled:
             edges_uv = self._helper_edges(xyr01)
-        n_nodes = int(batch["n_nodes"])
+        else:
+            edges_uv = torch.zeros((0, 2), dtype=torch.long, device=self.device)
 
         diff_loss = self.generator.diffusion_loss(xyr01)
         edge_loss = self._edge_loss(xyr01, edges_uv) if bool(self.hparams.learn_edges) else xyr01.new_tensor(0.0)
@@ -137,61 +142,81 @@ class DiffusionCriticLitModule(pl.LightningModule):
         self.manual_backward(g_loss)
         opt_g.step()
 
-        with torch.no_grad():
-            fake_xyr = self.generator.sample_nodes(
-                n_nodes=n_nodes,
-                sample_steps=int(self.hparams.critic_sample_steps),
-                device=self.device,
-            )
-        real_logit = self._real_logit(xyr01, edges_uv)
-        fake_logit = self._fake_logit(fake_xyr.detach(), detach_generator_edges=True)
-        corrupt_logit = self._corrupt_logit(xyr01, edges_uv)
-        c_loss = (
-            F.binary_cross_entropy_with_logits(real_logit.view(1), torch.ones(1, device=self.device))
-            + F.binary_cross_entropy_with_logits(fake_logit.view(1), torch.zeros(1, device=self.device))
-            + F.binary_cross_entropy_with_logits(corrupt_logit.view(1), torch.zeros(1, device=self.device))
-        ) / 3.0
-        opt_c.zero_grad()
-        self.manual_backward(c_loss)
-        opt_c.step()
+        if self.critic_enabled:
+            n_nodes = int(batch["n_nodes"])
+            with torch.no_grad():
+                fake_xyr = self.generator.sample_nodes(
+                    n_nodes=n_nodes,
+                    sample_steps=int(self.hparams.critic_sample_steps),
+                    device=self.device,
+                )
+            real_logit = self._real_logit(xyr01, edges_uv)
+            fake_logit = self._fake_logit(fake_xyr.detach(), detach_generator_edges=True)
+            corrupt_logit = self._corrupt_logit(xyr01, edges_uv)
+            c_loss = (
+                F.binary_cross_entropy_with_logits(real_logit.view(1), torch.ones(1, device=self.device))
+                + F.binary_cross_entropy_with_logits(fake_logit.view(1), torch.zeros(1, device=self.device))
+                + F.binary_cross_entropy_with_logits(corrupt_logit.view(1), torch.zeros(1, device=self.device))
+            ) / 3.0
+            opt_c.zero_grad()
+            self.manual_backward(c_loss)
+            opt_c.step()
+            self.log("train/critic_loss", c_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=1)
+            self.log("train/real_prob", torch.sigmoid(real_logit), on_step=True, on_epoch=True, prog_bar=True, batch_size=1)
+            self.log("train/fake_prob", torch.sigmoid(fake_logit), on_step=True, on_epoch=True, prog_bar=True, batch_size=1)
 
         self.log("train/g_loss", g_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=1)
         self.log("train/diff_loss", diff_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=1)
         self.log("train/edge_loss", edge_loss, on_step=True, on_epoch=True, batch_size=1)
-        self.log("train/critic_loss", c_loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=1)
-        self.log("train/real_prob", torch.sigmoid(real_logit), on_step=True, on_epoch=True, prog_bar=True, batch_size=1)
-        self.log("train/fake_prob", torch.sigmoid(fake_logit), on_step=True, on_epoch=True, prog_bar=True, batch_size=1)
+        self.log(
+            "train/critic_enabled",
+            xyr01.new_tensor(1.0 if self.critic_enabled else 0.0),
+            on_step=True,
+            on_epoch=True,
+            batch_size=1,
+        )
 
     def validation_step(self, batch: dict[str, Any], batch_idx: int) -> None:
         xyr01 = normalize_xyr(batch["xyr"].to(self.device), r_scale=self.r_scale)
         if bool(self.hparams.learn_edges):
             edges_uv = batch["edges_undirected"].to(self.device)
-        else:
+        elif self.critic_enabled:
             edges_uv = self._helper_edges(xyr01)
-        n_nodes = int(batch["n_nodes"])
+        else:
+            edges_uv = torch.zeros((0, 2), dtype=torch.long, device=self.device)
         diff_loss = self.generator.diffusion_loss(xyr01)
         edge_loss = self._edge_loss(xyr01, edges_uv) if bool(self.hparams.learn_edges) else xyr01.new_tensor(0.0)
-        fake_xyr = self.generator.sample_nodes(
-            n_nodes=n_nodes,
-            sample_steps=int(self.hparams.critic_sample_steps),
-            device=self.device,
-        )
-        real_logit = self._real_logit(xyr01, edges_uv)
-        fake_logit = self._fake_logit(fake_xyr.detach(), detach_generator_edges=True)
-        corrupt_logit = self._corrupt_logit(xyr01, edges_uv)
-        c_loss = (
-            F.binary_cross_entropy_with_logits(real_logit.view(1), torch.ones(1, device=self.device))
-            + F.binary_cross_entropy_with_logits(fake_logit.view(1), torch.zeros(1, device=self.device))
-            + F.binary_cross_entropy_with_logits(corrupt_logit.view(1), torch.zeros(1, device=self.device))
-        ) / 3.0
-        val_loss = diff_loss + float(self.hparams.lambda_edge) * edge_loss + c_loss
+        val_loss = diff_loss + float(self.hparams.lambda_edge) * edge_loss
+        if self.critic_enabled:
+            n_nodes = int(batch["n_nodes"])
+            fake_xyr = self.generator.sample_nodes(
+                n_nodes=n_nodes,
+                sample_steps=int(self.hparams.critic_sample_steps),
+                device=self.device,
+            )
+            real_logit = self._real_logit(xyr01, edges_uv)
+            fake_logit = self._fake_logit(fake_xyr.detach(), detach_generator_edges=True)
+            corrupt_logit = self._corrupt_logit(xyr01, edges_uv)
+            c_loss = (
+                F.binary_cross_entropy_with_logits(real_logit.view(1), torch.ones(1, device=self.device))
+                + F.binary_cross_entropy_with_logits(fake_logit.view(1), torch.zeros(1, device=self.device))
+                + F.binary_cross_entropy_with_logits(corrupt_logit.view(1), torch.zeros(1, device=self.device))
+            ) / 3.0
+            val_loss = val_loss + c_loss
+            self.log("val/critic_loss", c_loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=1)
+            self.log("val/real_prob", torch.sigmoid(real_logit), on_step=False, on_epoch=True, prog_bar=True, batch_size=1)
+            self.log("val/fake_prob", torch.sigmoid(fake_logit), on_step=False, on_epoch=True, prog_bar=True, batch_size=1)
+            self.log("val/corrupt_prob", torch.sigmoid(corrupt_logit), on_step=False, on_epoch=True, batch_size=1)
         self.log("val/loss", val_loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=1)
         self.log("val/diff_loss", diff_loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=1)
         self.log("val/edge_loss", edge_loss, on_step=False, on_epoch=True, batch_size=1)
-        self.log("val/critic_loss", c_loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=1)
-        self.log("val/real_prob", torch.sigmoid(real_logit), on_step=False, on_epoch=True, prog_bar=True, batch_size=1)
-        self.log("val/fake_prob", torch.sigmoid(fake_logit), on_step=False, on_epoch=True, prog_bar=True, batch_size=1)
-        self.log("val/corrupt_prob", torch.sigmoid(corrupt_logit), on_step=False, on_epoch=True, batch_size=1)
+        self.log(
+            "val/critic_enabled",
+            xyr01.new_tensor(1.0 if self.critic_enabled else 0.0),
+            on_step=False,
+            on_epoch=True,
+            batch_size=1,
+        )
 
     def configure_optimizers(self):
         opt_g = torch.optim.AdamW(
