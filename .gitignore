@@ -12,3 +12,6 @@ tessgen/models/edge/__pycache__/
 
 agent.md
 tessgen/models/edge_3/__pycache__/
+gan/__pycache__/
+gan/cli/__pycache__/
+gan/models/__pycache__/
